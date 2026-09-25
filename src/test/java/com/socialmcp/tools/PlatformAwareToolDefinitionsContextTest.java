@@ -54,7 +54,7 @@ class PlatformAwareToolDefinitionsContextTest {
 		@Test
 		void advertisesOnlyMastodon() {
 			List<SyncToolSpecification> specs = toolSpecs(context);
-			assertThat(specs).hasSize(11);
+			assertThat(specs).hasSize(16);
 			assertNoPlaceholderLeft(specs);
 			assertThat(specs).allSatisfy(spec -> {
 				assertThat(platformSchema(spec.tool())).containsEntry("enum", List.of("mastodon"))
@@ -118,7 +118,7 @@ class PlatformAwareToolDefinitionsContextTest {
 		@Test
 		void advertisesNoneWithoutEnum() {
 			List<SyncToolSpecification> specs = toolSpecs(context);
-			assertThat(specs).hasSize(11);
+			assertThat(specs).hasSize(16);
 			assertNoPlaceholderLeft(specs);
 			assertThat(specs).allSatisfy(spec -> {
 				assertThat(platformSchema(spec.tool())).doesNotContainKey("enum");

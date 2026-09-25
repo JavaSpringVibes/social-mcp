@@ -4,16 +4,25 @@ import java.util.List;
 
 import org.jspecify.annotations.Nullable;
 
+import com.socialmcp.model.AccountAction;
+import com.socialmcp.model.NewPost;
 import com.socialmcp.model.PartCheck;
+import com.socialmcp.model.PollInput;
+import com.socialmcp.model.PostAction;
+import com.socialmcp.model.PostActionResult;
 import com.socialmcp.model.PostInteractions;
 import com.socialmcp.model.PostResult;
 import com.socialmcp.model.PostingRules;
 import com.socialmcp.model.ProfileResult;
 import com.socialmcp.model.PublishedPost;
+import com.socialmcp.model.QuoteTarget;
+import com.socialmcp.model.RelationshipResult;
+import com.socialmcp.model.ReplyTarget;
 import com.socialmcp.model.SearchSort;
 import com.socialmcp.model.SimilarAccountsResult;
 import com.socialmcp.model.TimelineType;
 import com.socialmcp.model.TrendsResult;
+import com.socialmcp.model.VoteResult;
 
 /**
  * One social platform behind a common interface (SPEC §3).
@@ -31,6 +40,9 @@ public interface SocialPlatformService {
 
 	/** Whether {@code handle} (already stripped of a leading {@code @}) is valid on this platform (SPEC §6.7). */
 	boolean isValidHandle(String handle);
+
+	/** Whether the platform has polls at all (Mastodon yes, Bluesky no). Answered without any HTTP call. */
+	boolean supportsPolls();
 
 	List<PostResult> searchPosts(String query, SearchSort sort, int limit);
 
@@ -56,7 +68,44 @@ public interface SocialPlatformService {
 
 	PostingRules postingRules();
 
-	/** Measures one final post text, including any numbering suffix (SPEC §6.2). */
+	/** Measures one final post text, including any numbering suffix or reply mention prefix (SPEC §6.2). */
 	PartCheck checkPart(int index, String text);
+
+	/**
+	 * Performs one {@code setAccountRelationship} action (SPEC §4, Tool 12). Reads the current relationship first and
+	 * makes no write when there is nothing to change.
+	 */
+	RelationshipResult setRelationship(String handle, AccountAction action);
+
+	/**
+	 * Performs one {@code setPostAction} action (SPEC §4, Tool 13). Reads the post first and makes no write when there
+	 * is nothing to change.
+	 * @param postRef a post id or public URL (SPEC §6.9)
+	 */
+	PostActionResult setPostAction(String postRef, PostAction action);
+
+	/** The configured account's bookmarks, most recently bookmarked first (SPEC §4, Tool 15). */
+	List<PostResult> getBookmarks(int limit);
+
+	/** Reads the post being replied to and returns what the reply needs (SPEC §5, Reply). */
+	ReplyTarget replyTarget(String postRef);
+
+	/** Publishes {@code text}, already prefixed and measured, as a reply to {@code target}. */
+	PublishedPost reply(ReplyTarget target, String text);
+
+	/** Reads the post to quote and checks that the configured account may quote it (SPEC §5, Quote). */
+	QuoteTarget quoteTarget(String postRef);
+
+	/**
+	 * Publishes a top-level post with at most one of a quote or a poll (SPEC §4, Tool 8). The poll has already passed
+	 * SPEC §6.12.
+	 */
+	NewPost createTopLevelPost(String content, @Nullable QuoteTarget quote, @Nullable PollInput poll);
+
+	/**
+	 * Votes in the poll on a post (SPEC §4, Tool 16).
+	 * @param choices 1-based option numbers, already checked to be distinct and at least 1
+	 */
+	VoteResult vote(String postRef, List<Integer> choices);
 
 }

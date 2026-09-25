@@ -6,16 +6,27 @@ import java.util.function.IntPredicate;
 
 import org.jspecify.annotations.Nullable;
 
+import com.socialmcp.model.AccountAction;
+import com.socialmcp.model.AccountSummary;
+import com.socialmcp.model.NewPost;
 import com.socialmcp.model.PartCheck;
+import com.socialmcp.model.PollInput;
+import com.socialmcp.model.PollRules;
+import com.socialmcp.model.PostAction;
+import com.socialmcp.model.PostActionResult;
 import com.socialmcp.model.PostInteractions;
 import com.socialmcp.model.PostResult;
 import com.socialmcp.model.PostingRules;
 import com.socialmcp.model.ProfileResult;
 import com.socialmcp.model.PublishedPost;
+import com.socialmcp.model.QuoteTarget;
+import com.socialmcp.model.RelationshipResult;
+import com.socialmcp.model.ReplyTarget;
 import com.socialmcp.model.SearchSort;
 import com.socialmcp.model.SimilarAccountsResult;
 import com.socialmcp.model.TimelineType;
 import com.socialmcp.model.TrendsResult;
+import com.socialmcp.model.VoteResult;
 import com.socialmcp.platform.SocialPlatformService;
 import com.socialmcp.text.TextLength;
 
@@ -32,6 +43,13 @@ class FakePlatform implements SocialPlatformService {
 	final List<String[]> posted = new ArrayList<>();
 
 	IntPredicate failPostNumber = n -> false;
+
+	boolean polls = true;
+
+	/** What {@link #replyTarget} reports as the author to mention; null means no mention is needed. */
+	@Nullable String replyMention = "alice@example.social";
+
+	@Nullable String quoteCaveat;
 
 	FakePlatform(String id) {
 		this.id = id;
@@ -106,7 +124,69 @@ class FakePlatform implements SocialPlatformService {
 
 	@Override
 	public PostingRules postingRules() {
-		return new PostingRules(id, 20, "graphemes", null, null, 10, " (n/N)", 8, null, "", "fixed");
+		return new PostingRules(id, 20, "graphemes", null, null, 10, " (n/N)", 8, null, "", "fixed", true,
+				polls ? new PollRules(4, 50, 5, 43829) : null);
+	}
+
+	@Override
+	public boolean supportsPolls() {
+		return polls;
+	}
+
+	@Override
+	public RelationshipResult setRelationship(String handle, AccountAction action) {
+		calls.add("relationship:" + handle + ":" + action);
+		return new RelationshipResult(id, action.id(), "done", new AccountSummary(id, "1", "@" + handle, handle, "", "u"),
+				null);
+	}
+
+	@Override
+	public PostActionResult setPostAction(String postRef, PostAction action) {
+		calls.add("postAction:" + postRef + ":" + action);
+		return new PostActionResult(id, action.id(), "done", post(postRef));
+	}
+
+	@Override
+	public List<PostResult> getBookmarks(int limit) {
+		calls.add("bookmarks:" + limit);
+		return List.of();
+	}
+
+	@Override
+	public ReplyTarget replyTarget(String postRef) {
+		calls.add("replyTarget:" + postRef);
+		PublishedPost parent = new PublishedPost(postRef, null, "https://example/" + postRef);
+		return new ReplyTarget(post(postRef), parent, parent, "public", replyMention);
+	}
+
+	@Override
+	public PublishedPost reply(ReplyTarget target, String text) {
+		calls.add("reply:" + target.parent().id() + ":" + text);
+		return new PublishedPost("r1", null, "https://example/r1");
+	}
+
+	@Override
+	public QuoteTarget quoteTarget(String postRef) {
+		calls.add("quoteTarget:" + postRef);
+		return new QuoteTarget(new PublishedPost(postRef, null, "u"), "@alice@example.social", "public", quoteCaveat);
+	}
+
+	@Override
+	public NewPost createTopLevelPost(String content, @Nullable QuoteTarget quote, @Nullable PollInput poll) {
+		calls.add("topLevel:" + content + ":" + (quote == null ? null : quote.quoted().id()) + ":"
+				+ (poll == null ? null : poll.options()));
+		PublishedPost published = createPost(content, null, null);
+		return new NewPost(published, quote == null ? null : quote.caveat());
+	}
+
+	@Override
+	public VoteResult vote(String postRef, List<Integer> choices) {
+		calls.add("vote:" + postRef + ":" + choices);
+		return new VoteResult(id, "voted", post(postRef));
+	}
+
+	private PostResult post(String postRef) {
+		return new PostResult(id, postRef, "@alice@example.social", "text", null, "u", 0, 0, 0, null, null);
 	}
 
 	@Override

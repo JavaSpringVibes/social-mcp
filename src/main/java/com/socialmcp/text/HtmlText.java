@@ -7,6 +7,10 @@ import java.util.regex.Pattern;
 /** Converts Mastodon HTML ({@code content}, {@code note}) to plain text (SPEC §5, Mastodon). */
 public final class HtmlText {
 
+	/** An element with the {@code quote-inline} class, e.g. Mastodon's {@code <p class="quote-inline">RE: …</p>}. */
+	private static final Pattern QUOTE_INLINE = Pattern
+		.compile("(?is)<(\\w+)[^>]*\\bclass\\s*=\\s*\"[^\"]*\\bquote-inline\\b[^\"]*\"[^>]*>.*?</\\1\\s*>");
+
 	private static final Pattern PARAGRAPH_BREAK = Pattern.compile("(?i)</p>\\s*<p[^>]*>");
 
 	private static final Pattern LINE_BREAK = Pattern.compile("(?i)<br\\s*/?>");
@@ -22,10 +26,19 @@ public final class HtmlText {
 	}
 
 	public static String toPlainText(String html) {
+		return toPlainText(html, false);
+	}
+
+	/**
+	 * @param stripQuoteInline whether to drop {@code quote-inline} elements first. Mastodon prepends one to quote
+	 * posts as a fallback link for older clients; clients should hide it when the status has a {@code quote}.
+	 */
+	public static String toPlainText(String html, boolean stripQuoteInline) {
 		if (html == null || html.isEmpty()) {
 			return "";
 		}
-		String text = PARAGRAPH_BREAK.matcher(html).replaceAll("\n\n");
+		String text = stripQuoteInline ? QUOTE_INLINE.matcher(html).replaceAll("") : html;
+		text = PARAGRAPH_BREAK.matcher(text).replaceAll("\n\n");
 		text = LINE_BREAK.matcher(text).replaceAll("\n");
 		text = TAG.matcher(text).replaceAll("");
 		return decodeEntities(text).trim();

@@ -2,7 +2,10 @@ package com.socialmcp.model;
 
 import org.jspecify.annotations.Nullable;
 
-/** A platform's posting limits (SPEC §4, Tool 9). */
+/**
+ * A platform's posting limits (SPEC §4, Tool 9). {@code quotes} says whether quote posts are supported;
+ * {@code polls} is null where the platform has no polls.
+ */
 public record PostingRules(
 		String platform,
 		int maxLength,
@@ -14,5 +17,7 @@ public record PostingRules(
 		int numberingReserve,
 		@Nullable String followUpVisibility,
 		String countingNotes,
-		String source) {
+		String source,
+		boolean quotes,
+		@Nullable PollRules polls) {
 }

@@ -19,6 +19,13 @@ class HtmlTextTest {
 	}
 
 	@Test
+	void stripsQuoteInlineFallbackOnlyWhenAsked() {
+		String html = "<p class=\"quote-inline\">RE: <a href=\"https://m/@b/1\">https://m/@b/1</a></p><p>My take</p>";
+		assertThat(HtmlText.toPlainText(html, true)).isEqualTo("My take");
+		assertThat(HtmlText.toPlainText(html, false)).isEqualTo("RE: https://m/@b/1\n\nMy take");
+	}
+
+	@Test
 	void leavesUnknownEntitiesAndHandlesEmpty() {
 		assertThat(HtmlText.toPlainText("&bogus; ok")).isEqualTo("&bogus; ok");
 		assertThat(HtmlText.toPlainText(null)).isEmpty();
