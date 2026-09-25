@@ -15,6 +15,8 @@ Connect it to Claude Code, Claude Desktop or any other MCP client, and you can a
 The agent combines the server's tools to answer these questions. Both platforms are exposed through a single set of
 tools, and the server normalizes their APIs into one common shape.
 
+![Claude finding cat posts on Mastodon and Bluesky using SocialMCP](docs/images/cat-posts-example.png)
+
 Built with Java 25, Spring Boot 4.1 and Spring AI 2.0. It runs over the STDIO transport.
 
 ## Tools
