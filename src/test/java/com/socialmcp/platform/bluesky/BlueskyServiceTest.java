@@ -30,6 +30,7 @@ import static com.socialmcp.platform.TestSupport.enc;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.springframework.test.web.client.match.MockRestRequestMatchers.header;
+import static org.springframework.test.web.client.match.MockRestRequestMatchers.headerDoesNotExist;
 import static org.springframework.test.web.client.match.MockRestRequestMatchers.method;
 import static org.springframework.test.web.client.match.MockRestRequestMatchers.requestTo;
 import static org.springframework.test.web.client.response.MockRestResponseCreators.withStatus;
@@ -380,9 +381,19 @@ class BlueskyServiceTest {
 		PartCheck family = service.checkPart(1, FAMILY.repeat(300));
 		assertThat(family.ok()).isFalse();
 		assertThat(family.reason()).isEqualTo("7500/3000 bytes (4500 over)");
+		server.verify(); // no HTTP calls for length checks
+	}
+
+	@Test
+	void postingRulesAreFixedApartFromThePdsUploadLimit() {
+		server.expect(ExpectedCount.once(), requestTo(XRPC + "/com.atproto.server.describeServer"))
+			.andExpect(method(HttpMethod.GET))
+			.andExpect(headerDoesNotExist("Authorization"))
+			.andRespond(withSuccess("{\"did\":\"did:web:pds.test\",\"availableUserDomains\":[],\"blobUploadLimit\":314572800}",
+					MediaType.APPLICATION_JSON));
 		assertThat(service.postingRules().maxBytes()).isEqualTo(3000);
 		assertThat(service.postingRules().followUpVisibility()).isNull();
-		server.verify(); // no HTTP calls for length checks
+		server.verify(); // describeServer is fetched once and cached
 	}
 
 	@Test

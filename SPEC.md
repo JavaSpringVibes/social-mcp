@@ -11,6 +11,7 @@
 * read profile summaries with follower/following counts;
 * read each platform's posting limits and check draft posts against them;
 * create new text posts, including numbered self-threads for content that is too long for one post, posts that quote another post, and (on Mastodon) posts with a poll;
+* attach up to four images, each with alt text, to a new post or a reply. This works fully from Claude Code; from Claude Desktop, only for images given by path that already fit the limits (§4, "Client support for images");
 * reply to any post, including other people's;
 * follow, unfollow, block, unblock, mute and unmute accounts on behalf of the configured user;
 * like, repost and bookmark posts, undo each of those, and read the configured account's bookmarks;
@@ -34,11 +35,13 @@ The tools are designed to be combined by the agent to answer questions such as:
 | "Quote Craig's latest post and add my take" | `getSocialUserPosts(handle, limit=1)` → `createSocialPost(content, quote=<id>)` |
 | "Ask my Mastodon followers: Java or Kotlin?" | `getSocialPostingRules` (poll limits) → `createSocialPost(content, poll={options: ["Java", "Kotlin"]})` |
 | "Vote Java in that poll" / "How is my poll doing?" | read the post (its `poll`) → `voteInSocialPoll(post, choices=[1])`; for results, `getSocialTimeline(own)` or `getSocialPostInteractions` |
+| "Post this screenshot to Bluesky with a short caption" | `getSocialPostingRules` (image limits) → the agent writes alt text → `createSocialPost(content, images=[{source: "/home/me/shot.png", altText: "…"}])` |
+| "What's in the photo Alice just posted?" | `getSocialUserPosts(handle, limit=1)` → read `media[].altText`; the agent can open `media[].url` if its client can view images |
 | "Reply to the top reply on my latest post and thank them" | `getSocialTimeline(own, limit=1)` → `getSocialPostInteractions` → the agent drafts, `checkSocialPost` → `replyToSocialPost` |
 
 **Scope Boundaries:**
 
-* **Included:** Authenticating against each platform's REST API, normalizing posts and accounts into common shapes, search with `latest`/`top` sorting, the configured user's home feed and own posts, another user's public posts by handle, reading a post's replies, likes and reposts, trending tags/topics/posts, similar-account discovery, profile summaries, publishing each platform's posting limits, validating post length on the server, publishing single posts and **self-threads** (a chain of the configured user's own posts, each replying to the previous one), quote posts, polls and voting (Mastodon), replying to any post, following, unfollowing, blocking, unblocking, muting and unmuting an account by handle (unfollowing also cancels a pending Mastodon follow request), liking, reposting and bookmarking a post and undoing each, reading the configured account's bookmarks, exposing MCP tools via `@McpTool` annotations, and running over the STDIO transport.
+* **Included:** Authenticating against each platform's REST API, normalizing posts and accounts into common shapes, search with `latest`/`top` sorting, the configured user's home feed and own posts, another user's public posts by handle, reading a post's replies, likes and reposts, trending tags/topics/posts, similar-account discovery, profile summaries, publishing each platform's posting limits, validating post length on the server, publishing single posts and **self-threads** (a chain of the configured user's own posts, each replying to the previous one), quote posts, polls and voting (Mastodon), image attachments on new posts and replies (read from a local file or an `https://` URL, with required alt text), reading the media attached to posts, replying to any post, following, unfollowing, blocking, unblocking, muting and unmuting an account by handle (unfollowing also cancels a pending Mastodon follow request), liking, reposting and bookmarking a post and undoing each, reading the configured account's bookmarks, exposing MCP tools via `@McpTool` annotations, and running over the STDIO transport.
 * **Not Included (Out of Scope):**
   * **X (Twitter):** X already has its own MCP server, and its API is pay-per-use only (no free tier since February 2026), so supporting it here would duplicate work.
   * **Quote and poll management:** changing who may quote your posts (Mastodon `interaction_policy`, Bluesky postgates), revoking or detaching someone else's quote, setting a quote policy on new posts (the account's default applies), editing or ending a poll early, polls with media, and polls on Bluesky (the platform has none). Quotes and polls are created only by `createSocialPost`, not in threads or replies.
@@ -48,7 +51,15 @@ The tools are designed to be combined by the agent to answer questions such as:
   * **Mute options:** mutes are always full and indefinite. That means no Mastodon `duration` and no `notifications=false`, and no Bluesky reposts-only or quote-posts-only mutes. Muting a whole Mastodon server, muting words, and Bluesky mute lists are also out of scope.
   * **Follow options and bulk actions:** `setAccountRelationship` acts on one account per call, and `setPostAction` on one post per call. A follow uses the platform defaults (on Mastodon: boosts shown, no post notifications, all languages) and never changes the options of an existing follow. Removing followers (as opposed to unfollowing) is not supported.
   * **Automatic splitting on the server:** the agent decides where to split long content. The server only measures, numbers and publishes the parts.
-  * Media attachments (images/video), other users' home feeds, full follower/following **lists** (only counts are provided), notifications, webhooks/streaming, Bluesky rich-text facets (links and mentions are posted as plain, non-clickable text), markdown rendering, and pagination beyond the first page of each API call.
+  * **Other media and image options** (§6.14):
+    * video, audio and animated GIF-to-video conversion;
+    * Bluesky's `app.bsky.embed.gallery` (up to 10 images), so the limit stays 4 images on both platforms;
+    * resizing or recompressing images on the server: an image over a limit is rejected, and the agent resizes it;
+    * content warnings and sensitive-media flags (Mastodon `sensitive` / `spoiler_text`, Bluesky self-labels), custom thumbnails and focal points;
+    * editing alt text after posting;
+    * images in `createSocialThread` parts (post the first part with `createSocialPost` and continue with `replyToSocialPost`), and images combined with a poll, or with a quote on Mastodon, because Mastodon rejects both combinations (§6.14). On Bluesky, images and a quote can be combined;
+    * inline base64 image data in tool arguments.
+  * Other users' home feeds, full follower/following **lists** (only counts are provided), notifications, webhooks/streaming, Bluesky rich-text facets (links and mentions are posted as plain, non-clickable text), markdown rendering, and pagination beyond the first page of each API call.
   * No persistent database is required.
 
 ---
@@ -76,7 +87,7 @@ These versions match the project `pom.xml` and are mutually compatible (Spring A
 
 The system uses the Strategy Pattern to normalize disparate APIs behind one interface, so another platform can be added later without changing the tools.
 
-1. **`SocialMcpTools` (`@Component`):** Entry point. Exposes the sixteen tools in §4 via `@McpTool`. Resolves and validates the platform, handle, `limit`, `sort`, `type`, `parts`, `numbered`, `action`, `poll` and `choices` arguments (§6), applies thread numbering (§6.10) and the reply mention prefix, selects the matching strategy from the injected `List<SocialPlatformService>`, and delegates.
+1. **`SocialMcpTools` (`@Component`):** Entry point. Exposes the sixteen tools in §4 via `@McpTool`. Resolves and validates the platform, handle, `limit`, `sort`, `type`, `parts`, `numbered`, `action`, `poll`, `choices` and `images` arguments (§6), loads and checks images through `ImageLoader` (§6.14), applies thread numbering (§6.10) and the reply mention prefix, selects the matching strategy from the injected `List<SocialPlatformService>`, and delegates.
 2. **`SocialPlatformService` (interface):**
    * `String platform()` — canonical lowercase id (`"mastodon"`, `"bluesky"`).
    * `boolean isConfigured()` — whether the platform's credentials are present (§6.1).
@@ -96,10 +107,10 @@ The system uses the Strategy Pattern to normalize disparate APIs behind one inte
    * Both implementations dispatch on these enums with an exhaustive `switch`, so adding an action is a compile error until every platform handles it.
    * `List<PostResult> getBookmarks(int limit)` — the configured account's bookmarks (§4, Tool 15).
    * `QuoteTarget quoteTarget(String postRef)` — reads the post to quote, checks that the configured account may quote it, and returns what the new post needs (Mastodon: the status id, and the visibility the quote must use; Bluesky: the strong ref) plus an optional caveat for the confirmation (§5, **Quote**). Called before any posting call.
-   * `NewPost createTopLevelPost(String content, @Nullable QuoteTarget quote, @Nullable PollInput poll)` — publishes a top-level post with an optional quote or poll (at most one of them), and returns it with an optional caveat for the confirmation. With both `null` it behaves like `createPost(content, null, null)` above. (A separate name, because an overload would make `createPost(content, null, null)` ambiguous.) A thread part never has a quote or a poll. The Bluesky implementation throws the "doesn't support polls" message for a poll.
+   * `NewPost createTopLevelPost(String content, @Nullable QuoteTarget quote, @Nullable PollInput poll, List<PreparedImage> images)` — publishes a top-level post with an optional quote or poll (at most one of them) and zero to four images, and returns it with an optional caveat for the confirmation. `images` has already passed §6.14, including the combination rules, so the service only uploads and attaches them (§5, **Images**). With `null`, `null` and an empty list it behaves like `createPost(content, null, null)` above. (A separate name, because an overload would make `createPost(content, null, null)` ambiguous.) A thread part never has a quote, a poll or images. The Bluesky implementation throws the "doesn't support polls" message for a poll.
    * `VoteResult vote(String postRef, List<Integer> choices)` — votes with 1-based choices (§4, Tool 16). The Bluesky implementation throws the "doesn't support polls" message.
    * `ReplyTarget replyTarget(String postRef)` — reads the post being replied to and returns what the reply needs: the parent post (as a `PostResult`, for `ReplyResult.inReplyTo`), the ids of the parent and the thread root, the visibility to use, and `mention`, the author acct to mention (`null` when no mention is needed: always on Bluesky, and for the configured account's own posts) (§5). `SocialMcpTools` then adds the prefix `"@" + mention + " "` unless `content` already mentions that account (Tool 14), and measures the final text with `checkPart` **before** any posting call.
-   * `PublishedPost reply(ReplyTarget target, String text)` — publishes `text` (already prefixed and measured) as a reply to `target`.
+   * `PublishedPost reply(ReplyTarget target, String text, List<PreparedImage> images)` — publishes `text` (already prefixed and measured) as a reply to `target`, with zero to four images.
    * The `limit` passed to the read methods has already had the default applied and been capped at `social.read.max-limit`. Each service then caps it further at the endpoint max from §5 (§6.8).
 3. **Records** (all serialized to JSON by Spring AI):
    * **`PostResult`** — a normalized post (§4, Tool 1).
@@ -109,7 +120,7 @@ The system uses the Strategy Pattern to normalize disparate APIs behind one inte
    * **`TrendsResult`** — trending tags/topics and posts (§4, Tool 6).
    * **`SimilarAccountsResult`** — similar accounts plus how they were found (§4, Tool 7).
    * **`PostingRules`** — a platform's posting limits (§4, Tool 9).
-   * **`PostCheckResult`** / **`PartCheck`** — the per-part measurement of a draft (§4, Tool 10).
+   * **`PostCheckResult`** / **`PartCheck`** / **`ImageCheck`** (with **`Dimensions`** for `fitWithin`) — the per-part and per-image check of a draft (§4, Tool 10).
    * **`ThreadResult`** — the URLs of a published thread (§4, Tool 11).
    * **`RelationshipResult`** — the outcome of a `setAccountRelationship` action, and the account it applied to (§4, Tool 12).
    * **`PostActionResult`** — the outcome of a `setPostAction` action, and the post it applied to (§4, Tool 13).
@@ -120,18 +131,50 @@ The system uses the Strategy Pattern to normalize disparate APIs behind one inte
    * **`VoteResult`** — the outcome of a vote and the post with its updated poll (§4, Tool 16).
    * **`QuoteTarget`** — internal only. What a quoting post needs to know about the quoted post (§5).
    * **`PollRules`** — a platform's poll limits, the `polls` field of `PostingRules` (§4, Tool 9).
+   * **`ImageRules`** — a platform's image limits, the `images` field of `PostingRules` (§4, Tool 9).
+   * **`ImageInput`** — one item of the `images` parameter of `createSocialPost` and `replyToSocialPost`: `{source, altText}` (§4, Tool 8). Spring AI generates its JSON schema from the record.
+   * **`PreparedImage`** — internal only. An image that passed §6.14: its bytes (metadata already stripped where §6.14 says so), MIME type, width, height (after EXIF orientation), trimmed alt text, and its 1-based position for error messages.
+   * **`MediaSummary`** — one item of the `media` field of `PostResult` (§4, Tool 1).
    * **`PublishedPost`** — internal only (not returned by any tool). It carries the identifiers needed to reply to a post just created.
 4. **`MastodonService`:** Personal Access Token (Bearer auth).
 5. **`BlueskyService`:** AT Protocol (XRPC). Holds a cached session (§5, Bluesky).
 6. **`PlatformAwareToolDefinitions` (`BeanPostProcessor`):** Rewrites the tool definitions Spring AI generates from `@McpTool`, so that they advertise only the configured platforms (§4, "Platform-aware tool definitions").
-7. **`HtmlText`:** Stateless helper that converts Mastodon HTML (`content`, `note`) to plain text (§5, Mastodon).
-8. **`SocialProperties` (`@ConfigurationProperties("social")`, `@Validated`):** Typed, non-null binding of §7, with defaults and constraints.
+7. **`ImageLoader` (`@Component`):** Reads an `ImageInput` from a local file or an `https://` URL, sniffs its type from its first bytes, reads its dimensions and EXIF orientation from the header, and strips metadata when asked. Its one entry point, `inspect(int index, ImageInput input, ImageRules rules, boolean stripMetadata)`, collects every problem into an `ImageCheck` (with `fitWithin`) and returns it with the `PreparedImage` when there are none. `checkSocialPost` returns the `ImageCheck`s. The posting tools throw the first problem as the §6.14 message, so both paths always agree. It never decodes pixels and never re-encodes an image. It makes no platform calls; its only network access is the URL download.
+8. **`HtmlText`:** Stateless helper that converts Mastodon HTML (`content`, `note`) to plain text (§5, Mastodon).
+9. **`SocialProperties` (`@ConfigurationProperties("social")`, `@Validated`):** Typed, non-null binding of §7, with defaults and constraints.
 
 ---
 
 ## 4. MCP Interface Contracts
 
 JSON Schema is generated automatically from `@McpTool` / `@McpToolParam`. Every tool description must name the platforms it works on (through the `{platforms}` placeholder, below) and summarize its return shape, so the calling model can choose and chain tools without trial calls.
+
+**Server instructions.** The server sends the MCP `instructions` field in its `initialize` response (`spring.ai.mcp.server.instructions`, §7). Clients such as Claude Code show it to the model once per session, before any tool is chosen, so it carries the workflows that span several tools. The text, kept short because it is sent in every session:
+
+> Social posting workflows. Text: never count characters yourself; measure drafts with checkSocialPost, and split long content into parts for createSocialThread. Images: limits differ by platform and server, and this server never resizes. Before attaching images to createSocialPost or replyToSocialPost, call checkSocialPost with them; resize or convert every image it reports (use its fitWithin size, or convert to JPEG) with your own tools, check again, and post only when all are ok. Images must be files on the user's computer, given by absolute path (or https URLs); images attached to the chat can't be posted, so ask the user for the file's path. If you can't resize or convert an image yourself, tell the user which images need it and the fitWithin size, and suggest they resize them or use a client that can run commands, such as Claude Code. Every image needs alt text that describes what it shows. Write actions (posting, following, blocking, liking, voting) happen only when the user asked for them.
+
+**How the agent learns to check images first**, strongest to weakest:
+* the `images` parameter description on `createSocialPost` and `replyToSocialPost`, which the model reads while filling in the argument;
+* those two tool descriptions, each written out in full;
+* the server instructions above;
+* the `getSocialPostingRules` and `checkSocialPost` descriptions;
+* as a last line of defence, a posting call with a bad image is rejected before any upload, with a message that names the limit and says to resize (§6.14).
+
+**Client support for images.** The server runs on the user's computer and reads images from paths on that computer. Whether a client can post images depends on two things: whether it can give the server a real file path, and whether it can run commands to resize or convert images that `checkSocialPost` reports.
+
+| Client | Real file paths | Resizing / converting | Result |
+|---|---|---|---|
+| **Claude Code** | Yes: it works in the user's file system | Yes: it runs shell commands (ImageMagick, `sips`, PowerShell, Python) | **Fully supported.** This is the recommended client for posting images. |
+| **Claude Desktop** (chat) | Only if the user types or pastes a path | No, unless another MCP server gives it a way to run commands | Works for images that already fit the limits, given by path. It can't post a photo attached to the chat, because the model sees the image but has no path to pass. |
+| **Cowork** | No: its files live in a sandbox VM under different paths than the server sees | Inside the VM only, where the server can't read the result | Not supported for images. Text tools work. |
+| Any client with `https://` image URLs | n/a | n/a | Works if the images already fit the limits. |
+
+The server doesn't try to detect the client. The MCP `initialize` request carries a client name, but choosing behaviour by it would be fragile and would break for clients that aren't listed. Instead, every failure gives the user a way forward:
+* The agent is told (server instructions, `images` parameter description) that attached images can't be posted, to ask for a path, and to suggest Claude Code when it can't resize.
+* A path that looks like a chat-upload or sandbox location gets its own "not found" message that explains this (§6.14, step 5).
+* `checkSocialPost` gives the exact `fitWithin` size, so a user without a capable client can resize by hand.
+
+The README must state this, including that images work best from Claude Code.
 
 **Platform-aware tool definitions.** A deployment may configure only one platform (e.g. Mastodon credentials only), and the tool definitions must not advertise a platform the server can't use. At startup, `PlatformAwareToolDefinitions` rewrites every tool definition that has a `platform` parameter:
 * **Tool description:** the `{platforms}` placeholder in the `@McpTool` description is replaced with the configured platforms' display names, e.g. `Mastodon` or `Mastodon or Bluesky`. Platform-specific notes in a description (e.g. "On Mastodon, …") stay as written.
@@ -168,10 +211,19 @@ JSON Schema is generated automatically from `@McpTool` / `@McpToolParam`. Every 
       "repostCount": 12,
       "likeCount": 57,
       "quote": null,
-      "poll": null
+      "poll": null,
+      "media": []
     }
   ]
   ```
+  * `media` (array of `MediaSummary`, `[]` when the post has none): the images, videos and other files attached to the post, in order.
+    ```json
+    { "type": "image", "url": "https://files.mastodon.social/media_attachments/…/original/a.png", "previewUrl": "https://…/small/a.png", "altText": "A cat asleep on a keyboard" }
+    ```
+    * `type` is `image`, `gifv` (a looping silent video, which is how Mastodon stores an uploaded GIF), `video`, `audio` or `unknown`.
+    * `url` is the full-size file (on Bluesky, a video's HLS playlist). `previewUrl` is a thumbnail, or `null`.
+    * `altText` is the author's description, or `null` when they gave none. An agent that can't view images can use it to describe the post.
+    * A quoted post's media are not included (same no-nesting rule as `quote`).
   * `quote` (`QuoteSummary`, or `null` when the post quotes nothing): the post this one quotes.
     ```json
     { "state": "accepted", "id": "113240...", "author": "@bob@example.social", "text": "the quoted text", "url": "https://..." }
@@ -331,13 +383,16 @@ JSON Schema is generated automatically from `@McpTool` / `@McpToolParam`. Every 
 
 ### Tool 8: `createSocialPost`
 
-* **Description:** Publishes a single new public text post on behalf of the configured account (the one exception: quoting a Mastodon followers-only post makes the new post followers-only too, §5). It can optionally **quote** another post, or (on Mastodon only) carry a **poll**. For content longer than the platform limit, use `createSocialThread` instead. The `@McpTool` description must tell the model:
-  * that `quote` and `poll` can't be combined;
+* **Description:** Publishes a single new public text post on behalf of the configured account (the one exception: quoting a Mastodon followers-only post makes the new post followers-only too, §5). It can optionally **quote** another post, carry up to four **images**, or (on Mastodon only) carry a **poll**. For content longer than the platform limit, use `createSocialThread` instead. The `@McpTool` description must tell the model:
+  * that `quote` and `poll` can't be combined, that `images` can't be combined with `poll`, and that on Mastodon `images` can't be combined with `quote` either;
   * that polls are Mastodon-only;
-  * to check the limits in `getSocialPostingRules` (`polls`) before drafting a poll.
+  * to check the limits in `getSocialPostingRules` (`polls`) before drafting a poll;
+  * to check images with `checkSocialPost` (its `images` parameter) before attaching them. The server never resizes an image, so the model resizes or converts any image the check reports (to the `fitWithin` size, or to JPEG) with its own tools, checks again, and posts only when every image is `ok`;
+  * that each image needs alt text describing what it shows for people who can't see it, written by looking at the image when the model can, and otherwise from what the user said about it, never invented;
+  * to post an image only when the user asked for that image to be posted, because a file's contents are published.
 * **Parameters:**
   * `platform`: common.
-  * `content` (String, required, non-blank): Plain text. It is posted verbatim; no markdown is rendered on either platform.
+  * `content` (String, required): Plain text. It is posted verbatim; no markdown is rendered on either platform. It must be non-blank unless `images` is given, because both platforms allow a post that is only images.
   * `quote` (String, optional): the post to quote, in the common `post` format. The quoted post is attached as an embedded quote, not as a link in the text.
   * `poll` (object, optional): `{options, expiresInMinutes, multiple, hideTotals}` (`PollInput`).
     * `options` (array of String, required): the answers, in order.
@@ -345,19 +400,25 @@ JSON Schema is generated automatically from `@McpTool` / `@McpToolParam`. Every 
     * `multiple` (Boolean, optional, default `false`): whether voters may pick more than one answer.
     * `hideTotals` (Boolean, optional, default `false`): whether to hide the counts until the poll ends.
     * The limits come from the instance (§6.12).
+  * `images` (array of object, optional, 1 to `images.maxImages` items): the images to attach, in display order (`ImageInput`). The `@McpToolParam` description must say, in short form: "Each item: an absolute file path or https URL, and alt text. Size and format limits differ by platform and server, and the server never resizes. Before attaching, call `checkSocialPost` with these images; resize or convert any it reports, check again, then post. Images attached to the chat can't be posted: ask the user for the file's path on their computer. If you can't resize an image, tell the user the fitWithin size, or suggest Claude Code."
+    * `source` (String, required): an **absolute** local file path (e.g. `/home/me/chart.png`, `C:\Users\me\chart.png`), a `file:` URI, or an `https://` URL. The server reads or downloads the file itself; image data is never passed inline.
+    * `altText` (String, required, non-blank): the image description shown to screen-reader users, at most `images.maxAltTextLength` graphemes.
+    * Supported formats are JPEG, PNG, GIF and WebP, limited further by what the instance accepts (`images.mimeTypes`). The file's type is taken from its first bytes, not its name or `Content-Type`. All checks are in §6.14.
 * **Returns:** String confirmation, e.g. `"Posted to bluesky: https://bsky.app/profile/alice.bsky.social/post/3k..."`. When the result needs a caveat, it is appended in parentheses, e.g. `"Posted to mastodon: https://… (the quote is waiting for @bob@example.social to approve it)"`.
 * **Preconditions (checked in order, all before any posting call):**
   1. `social.posting-enabled` is `true`.
   2. The platform is configured.
-  3. `content` is non-blank and within the platform limits (§6.2). If it is too long, the error message suggests `createSocialThread`, e.g. `"Content is 812/500 graphemes (312 over) on mastodon. Split it into parts and use createSocialThread."` (The middle uses the same `reason` text as `checkSocialPost`.) An embedded quote and a poll don't count toward the text length on either platform.
+  3. `content` is non-blank (or `images` is non-empty, and `content` may then be blank or omitted, and is posted as `""`) and within the platform limits (§6.2). If it is too long, the error message suggests `createSocialThread`, e.g. `"Content is 812/500 graphemes (312 over) on mastodon. Split it into parts and use createSocialThread."` (The middle uses the same `reason` text as `checkSocialPost`.) An embedded quote, a poll and images don't count toward the text length on either platform.
   4. `quote` and `poll` are not both given. Otherwise → `IllegalArgumentException("A post can have a quote or a poll, not both")`.
-  5. With `poll`: the platform supports polls, and the poll passes §6.12. On Bluesky → `IllegalArgumentException("Bluesky doesn't support polls")`.
-  6. With `quote`: the quoted post exists, is visible, and the configured account may quote it (§5, **Quote**). Otherwise → `IllegalArgumentException("Post '<quote>' not found on <platform>")` or `IllegalArgumentException("You can't quote this post on <platform> (<reason>)")`.
-* `createSocialThread` and `replyToSocialPost` don't take `quote` or `poll`. To quote or poll inside a thread, the agent posts the first part with `createSocialPost` and continues with replies.
+  5. With `images`: the combination rules and every per-image check of §6.14 pass, for all images, before anything is uploaded. On Mastodon, `images` with `quote` → `IllegalArgumentException("Mastodon doesn't allow images in a quote post")`. With `poll` (either platform) → `IllegalArgumentException("A post can have images or a poll, not both")`.
+  6. With `poll`: the platform supports polls, and the poll passes §6.12. On Bluesky → `IllegalArgumentException("Bluesky doesn't support polls")`.
+  7. With `quote`: the quoted post exists, is visible, and the configured account may quote it (§5, **Quote**). Otherwise → `IllegalArgumentException("Post '<quote>' not found on <platform>")` or `IllegalArgumentException("You can't quote this post on <platform> (<reason>)")`.
+* **Uploads:** images are uploaded one at a time, in order, after every precondition has passed and before the post is created (§5, **Images**). If an upload fails → `IllegalStateException("Image <i> of <N> could not be uploaded to <platform>: <reason>. Nothing was posted.")`. Images uploaded before the failure are left for the platform to discard (§5).
+* `createSocialThread` doesn't take `quote`, `poll` or `images`, and `replyToSocialPost` takes only `images`. To quote, poll or add images inside a thread, the agent posts the first part with `createSocialPost` and continues with replies.
 
 ### Tool 9: `getSocialPostingRules`
 
-* **Description:** Returns the platform's posting limits and how length is counted, so the agent can plan how to split long content into thread parts. It also says whether the platform supports quote posts, and what its poll limits are. Agents should not count characters themselves: they should use `checkSocialPost` to measure drafts.
+* **Description:** Returns the platform's posting limits and how length is counted, so the agent can plan how to split long content into thread parts. It also says whether the platform supports quote posts, and what its poll and image limits are. Agents should not count characters themselves: they should use `checkSocialPost` to measure drafts. The `@McpTool` description must also say that the `images` limits are for planning, and that `checkSocialPost` checks the actual image files against them.
 * **Parameters:**
   * `platform`: common.
 * **Returns:** A JSON object (`PostingRules`):
@@ -375,7 +436,18 @@ JSON Schema is generated automatically from `@McpTool` / `@McpToolParam`. Every 
     "countingNotes": "Counts user-perceived characters (an emoji counts as 1). Every http(s) URL counts as 23. A mention @user@domain counts only as @user.",
     "source": "instance",
     "quotes": true,
-    "polls": { "maxOptions": 4, "maxOptionLength": 50, "minExpiresInMinutes": 5, "maxExpiresInMinutes": 43829 }
+    "polls": { "maxOptions": 4, "maxOptionLength": 50, "minExpiresInMinutes": 5, "maxExpiresInMinutes": 43829 },
+    "images": {
+      "maxImages": 4,
+      "maxBytes": 16777216,
+      "maxPixels": 33177600,
+      "maxAltTextLength": 1500,
+      "mimeTypes": ["image/jpeg", "image/png", "image/gif", "image/webp"],
+      "withQuote": false,
+      "withPoll": false,
+      "recommendedMaxDimension": null,
+      "source": "instance"
+    }
   }
   ```
   ```json
@@ -392,11 +464,34 @@ JSON Schema is generated automatically from `@McpTool` / `@McpToolParam`. Every 
     "countingNotes": "Counts user-perceived characters (an emoji counts as 1). URLs count at their full length.",
     "source": "fixed",
     "quotes": true,
-    "polls": null
+    "polls": null,
+    "images": {
+      "maxImages": 4,
+      "maxBytes": 2000000,
+      "maxPixels": null,
+      "maxAltTextLength": 2000,
+      "mimeTypes": ["image/jpeg", "image/png", "image/gif", "image/webp"],
+      "withQuote": true,
+      "withPoll": false,
+      "recommendedMaxDimension": 4000,
+      "source": "lexicon+server"
+    }
   }
   ```
   * `quotes`: whether `createSocialPost` can quote on this platform. It is `true` on Bluesky. On Mastodon it is `true` when the instance reports `api_versions.mastodon` ≥ 7 (Mastodon 4.5, which added quote posts), and `false` otherwise, including when the instance fetch fell back.
   * `polls`: the poll limits (`maxOptionLength` in graphemes, expirations in whole minutes, rounded inward), or `null` where the platform has no polls (Bluesky).
+  * `images` (`ImageRules`): the image limits that §6.14 enforces.
+    * `maxImages`: images per post.
+    * `maxBytes`: the largest file accepted, after metadata stripping.
+    * `maxPixels`: the largest width × height, or `null` if the platform has no pixel limit.
+    * `maxAltTextLength`: in graphemes.
+    * `mimeTypes`: the formats this server will send, which are the formats it can sniff (§6.14) that the platform also accepts.
+    * `withQuote` / `withPoll`: whether images can go in the same post as a quote or a poll.
+    * `recommendedMaxDimension`: the longest side, in pixels, that the platform's official app uploads (Bluesky: 4000), or `null`. It is a suggestion, not a limit: a larger image isn't rejected for it, but `fitWithin` in `checkSocialPost` uses it whenever an image has to be resized anyway.
+    * `source`: where the limits came from:
+      * `"instance"` or `"fallback"` on Mastodon, as for the text limits;
+      * on Bluesky, `"lexicon+server"` when `maxBytes` also took the PDS's `describeServer` limit into account, or `"lexicon"` when that call failed or the PDS reported no limit (§5).
+    * These are for planning. `checkSocialPost` with `images` checks the actual files against them and says how to fix each one.
   * `unit`: always `"graphemes"` (user-perceived characters) on both current platforms. The field exists so that a future platform with a different unit can report it.
   * `urlLength`: the fixed length each URL counts as, or `null` if URLs count at their full length.
   * `maxBytes`: an additional UTF-8 byte limit, or `null` if there is none.
@@ -408,11 +503,12 @@ JSON Schema is generated automatically from `@McpTool` / `@McpToolParam`. Every 
 
 ### Tool 10: `checkSocialPost`
 
-* **Description:** Measures draft post texts against the platform's limits without posting anything. Use it to check how long content was split before calling `createSocialThread`, and rewrite only the parts it reports as too long.
+* **Description:** Measures draft post texts against the platform's limits, and checks image files against the platform's image limits, without posting or uploading anything. Use it to check how long content was split before calling `createSocialThread`, and rewrite only the parts it reports as too long. Before attaching images to `createSocialPost` or `replyToSocialPost`, check them here, resize or convert any image it reports (it gives the target size), and check again.
 * **Parameters:**
   * `platform`: common.
-  * `parts` (array of String, required, at least 1 item): The draft texts in order. A single-item array checks one standalone post.
+  * `parts` (array of String, at least 1 item; required unless `images` is given): The draft texts in order. A single-item array checks one standalone post. When checking only images, `parts` may be omitted.
   * `numbered` (Boolean, optional, default `true`): Whether to measure each part with the numbering suffix `createSocialThread` would add (§6.10). This is ignored when `parts` has one item.
+  * `images` (array of object, optional): the images one post would carry, in the same `ImageInput` form as Tool 8 (`source`, `altText`). They are checked as a set for one post, so `maxImages` applies to the whole list. `altText` may be omitted here; a missing one is reported as a problem, not an error, so the agent can check files before writing descriptions.
 * **Returns:** A JSON object (`PostCheckResult`):
   ```json
   {
@@ -425,6 +521,40 @@ JSON Schema is generated automatically from `@McpTool` / `@McpToolParam`. Every 
       { "index": 1, "text": "First part… (1/3)", "length": 281, "bytes": 290, "ok": true, "reason": null },
       { "index": 2, "text": "Second part… (2/3)", "length": 327, "bytes": 335, "ok": false, "reason": "327/300 graphemes (27 over)" },
       { "index": 3, "text": "Third part… (3/3)", "length": 118, "bytes": 120, "ok": true, "reason": null }
+    ],
+    "images": []
+  }
+  ```
+  With `images` (here on Bluesky, with `parts` omitted):
+  ```json
+  {
+    "platform": "bluesky",
+    "valid": false,
+    "maxLength": 300,
+    "unit": "graphemes",
+    "problems": [
+      "Image 1 is 4718592 bytes; the maximum on bluesky is 2000000 bytes. Resize or recompress it and try again",
+      "Image 2 is not a JPEG, PNG, GIF or WebP image. Convert it to JPEG"
+    ],
+    "parts": [],
+    "images": [
+      {
+        "index": 1, "source": "C:\\tour\\IMG_0412.jpg", "ok": false,
+        "mimeType": "image/jpeg", "bytes": 4718592, "width": 4032, "height": 3024,
+        "problems": ["is 4718592 bytes; the maximum on bluesky is 2000000 bytes. Resize or recompress it and try again."],
+        "fitWithin": { "width": 2490, "height": 1867 }
+      },
+      {
+        "index": 2, "source": "C:\\tour\\beach.heic", "ok": false,
+        "mimeType": null, "bytes": 2201600, "width": null, "height": null,
+        "problems": ["is not a JPEG, PNG, GIF or WebP image. Convert it to JPEG."],
+        "fitWithin": null
+      },
+      {
+        "index": 3, "source": "C:\\tour\\map.png", "ok": true,
+        "mimeType": "image/png", "bytes": 812345, "width": 1600, "height": 1200,
+        "problems": [], "fitWithin": null
+      }
     ]
   }
   ```
@@ -434,9 +564,21 @@ JSON Schema is generated automatically from `@McpTool` / `@McpToolParam`. Every 
   * A blank part → `ok: false`, `reason: "blank"`.
   * More parts than `maxThreadParts` → `valid: false`, with a `problems` entry such as `"12 parts, but the maximum is 10"`. Each part is still measured.
   * `problems` entries have no trailing period. Per-part entries use the format `"Part <index> is <reason>"`, e.g. `"Part 4 is blank"`.
-  * `valid` is `true` only when every part is `ok` and the part count is within the maximum.
-  * Invalid drafts are **not** an error: the tool returns `valid: false` so the agent can fix them. Only argument errors throw, e.g. a missing or empty `parts` → `IllegalArgumentException("parts must contain at least one item")`.
-  * Requires the platform to be configured. It does **not** require `social.posting-enabled`.
+  * `valid` is `true` only when every part is `ok`, the part count is within the maximum, and every image is `ok` (with no image-count problem).
+  * `parts` is `[]` when `parts` was omitted, and `images` is `[]` when `images` was omitted.
+  * **Image checks** (`ImageCheck`): each image goes through the same §6.14 steps as when posting, including the URL download and the platform's metadata stripping, but nothing is uploaded, and problems are **reported instead of thrown**:
+    * All problems for an image are collected, not only the first. Once the file can't be read or its type isn't recognized, the later checks are skipped.
+    * `problems[]` holds the §6.14 messages without their leading `"Image <i>"` / `"Image <i>:"` (the item already has `index`). The top-level `problems` repeats each message in full, with the prefix and without its final period (like every `problems` entry).
+    * `mimeType`, `width` and `height` are the sniffed values (after EXIF orientation), or `null` when they couldn't be read. `bytes` is the size that would be uploaded, i.e. after metadata stripping, or the raw size when the type is unknown, or `null` when the file couldn't be read.
+    * More images than `maxImages` → a top-level problem `"<n> images, but the maximum on <platform> is <maxImages>"`, and each image is still checked.
+    * The Tool 8 combination rules (quote, poll) aren't checked here, because this tool takes neither. The limits in `getSocialPostingRules` (`withQuote`, `withPoll`) say which combinations are allowed.
+    * **`fitWithin`** (`{width, height}`, or `null`): the size to resize to, keeping the aspect ratio. It is set only when an image fails on `maxBytes` or `maxPixels`, and `null` otherwise (including format-only problems). It is the image's size multiplied by `s = min(1, a, b, c)`, each value rounded down:
+      * `a` = √(`maxPixels` / (`width` × `height`)), when `maxPixels` is set;
+      * `b` = `recommendedMaxDimension` / max(`width`, `height`), when set;
+      * `c` = √(0.9 × `maxBytes` / `bytes`), when the image is over `maxBytes`. This is an **estimate**: a JPEG's size scales roughly with its pixel count at the same quality. The 0.9 leaves a margin, and the agent should re-encode as JPEG at about quality 85 and check again.
+      * In the example, `c` = √(0.9 × 2,000,000 / 4,718,592) ≈ 0.618, and `b` = 4000 / 4032 ≈ 0.992, so `s` ≈ 0.618 → 2490 × 1867 (rounded down).
+  * Invalid drafts and images are **not** an error: the tool returns `valid: false` so the agent can fix them. Only argument errors throw, e.g. neither `parts` nor `images` given, or an empty `parts` → `IllegalArgumentException("parts must contain at least one item")`.
+  * Requires the platform to be configured. It does **not** require `social.posting-enabled`: it reads and downloads images, but it never uploads or posts anything.
 
 ### Tool 11: `createSocialThread`
 
@@ -578,15 +720,17 @@ JSON Schema is generated automatically from `@McpTool` / `@McpToolParam`. Every 
 
 ### Tool 14: `replyToSocialPost`
 
-* **Description:** Publishes a text reply to any post, including other people's posts and the configured account's own posts, as the configured account. The `@McpTool` description must tell the model to:
+* **Description:** Publishes a text reply, optionally with up to four images, to any post, including other people's posts and the configured account's own posts, as the configured account. The `@McpTool` description must tell the model to:
   * call it only when the user has asked to reply, and to show the user the exact reply text first unless the user dictated it;
+  * with images: check them with `checkSocialPost` (its `images` parameter) before attaching them, and resize or convert any it reports with its own tools, since the server never resizes; give every image alt text that describes what it shows, never invented; and attach only images the user asked to post. This is written out in full rather than as a reference to `createSocialPost`, because a model reading one tool's description doesn't necessarily read the other's;
   * measure drafts with `checkSocialPost`, including the `@mention` in the measured text on Mastodon. The server adds the mention automatically (see below), and it counts toward the limit, but `checkSocialPost` doesn't know about it.
 
   Plain text only, as for `createSocialPost`.
 * **Parameters:**
   * `platform`: common.
   * `post` (String, required): the post being replied to, as an `id` or public URL (§6.9).
-  * `content` (String, required, non-blank): the reply text. It is trimmed and otherwise posted verbatim, apart from the Mastodon mention prefix below.
+  * `content` (String, required): the reply text. It is trimmed and otherwise posted verbatim, apart from the Mastodon mention prefix below. It must be non-blank unless `images` is given. On Mastodon an image-only reply still gets the mention prefix, so its text is just `"@<author acct>"` (trimmed).
+  * `images` (array of object, optional): as for `createSocialPost` (Tool 8), checked with §6.14, with the same `@McpToolParam` description, which tells the model to call `checkSocialPost` first. A reply can't carry a quote or a poll, so the combination rules don't apply.
 * **Returns:** A JSON object (`ReplyResult`):
   ```json
   {
@@ -602,10 +746,11 @@ JSON Schema is generated automatically from `@McpTool` / `@McpToolParam`. Every 
 * **Preconditions (checked in order, all before the posting call):**
   1. `social.posting-enabled` is `true`. Otherwise → `IllegalStateException("Posting is disabled")` (a reply is a post).
   2. The platform is configured.
-  3. `post` is a valid reference (§6.9), and `content` is non-blank. Otherwise → the §6.9 invalid-reference message, or `IllegalArgumentException("content must not be blank")`, with no HTTP call.
+  3. `post` is a valid reference (§6.9), and `content` is non-blank or `images` is non-empty. Otherwise → the §6.9 invalid-reference message, or `IllegalArgumentException("content must not be blank")`, with no HTTP call.
   4. The parent post exists and is visible. Otherwise → the Tool 5 not-found message.
   5. Replies are allowed. On Bluesky, the author can restrict who may reply with a threadgate. If the parent's `viewer.replyDisabled` is `true` → `IllegalArgumentException("The author of this post on bluesky has restricted who can reply")`. Mastodon has no equivalent.
   6. The final text (prefix + trimmed `content`) is within the platform limits (§6.2, measured with `checkPart`). Otherwise → `IllegalArgumentException("Reply is <reason> on <platform>. Shorten it; replies are single posts.")`. When a prefix was added, the message ends with `" The automatic mention '@<acct> ' counts toward the limit."`.
+  7. With `images`: every §6.14 check passes. Uploads then happen as for Tool 8, with the same "Nothing was posted" failure message.
 * No thread splitting: a reply is one post. For a longer answer, the agent replies, then replies again to its own reply (using `ReplyResult.url` as `post`).
 
 ### Tool 15: `getSocialBookmarks`
@@ -651,19 +796,20 @@ JSON Schema is generated automatically from `@McpTool` / `@McpToolParam`. Every 
 
 ## 5. Platform API Specifications
 
-**Verified 2026-09-25** against docs.joinmastodon.org, the Mastodon source (`StatusLengthValidator`, `StatusPolicy`, `FollowService`, `FollowLimitValidator`, `UnfollowService`, `BlockService`, `FavouriteService`, `PollOptionsValidator`, `PollExpirationValidator`, `VoteValidator`), and the Bluesky lexicons in `bluesky-social/atproto` (`lexicons/`). The old docs.bsky.app API pages now redirect to endpoints.bsky.app, so the lexicon JSON is the reference. Re-check the Bluesky `unspecced` endpoints before each release.
+**Verified 2026-09-25** (images: **2026-09-26**, against docs.joinmastodon.org `methods/media`, `methods/statuses`, `entities/Instance` and `client/quotes`, and the lexicons `com.atproto.repo.uploadBlob`, `app.bsky.embed.images`, `app.bsky.embed.recordWithMedia`, `app.bsky.embed.gallery` and `app.bsky.embed.defs`) against docs.joinmastodon.org, the Mastodon source (`StatusLengthValidator`, `StatusPolicy`, `FollowService`, `FollowLimitValidator`, `UnfollowService`, `BlockService`, `FavouriteService`, `PollOptionsValidator`, `PollExpirationValidator`, `VoteValidator`), and the Bluesky lexicons in `bluesky-social/atproto` (`lexicons/`). The old docs.bsky.app API pages now redirect to endpoints.bsky.app, so the lexicon JSON is the reference. Re-check the Bluesky `unspecced` endpoints before each release.
 
 In this section, `{n}` is the effective limit after clamping (§6.8). The **max** noted for each read endpoint is its per-request page size limit, which the service applies.
 
 ### Mastodon
 
 * **Base URL:** `social.mastodon.instance-url` (e.g. `https://mastodon.social`).
-* **Auth:** Personal Access Token (non-expiring by default). Create it under Preferences > Development > New Application with scopes `read:search read:statuses read:accounts write:statuses read:follows write:follows write:blocks write:mutes write:favourites write:bookmarks read:bookmarks`. `write:statuses` covers posts (including quotes and polls), threads, replies, reposts and votes. The rest are needed only by the tools that use them: `read:follows` by `setAccountRelationship` (it covers `GET /api/v1/accounts/relationships`), `write:follows` by follow and unfollow, `write:blocks` by block and unblock, `write:mutes` by mute and unmute, `write:favourites` by like and unlike, `write:bookmarks` by bookmark and unbookmark, and `read:bookmarks` by `getSocialBookmarks`. A token created without them keeps working for every other tool. To add them later, tick the scopes on the application, save, then use **Regenerate access token** (Mastodon doesn't widen an existing token) and update `MASTODON_ACCESS_TOKEN`.
+* **Auth:** Personal Access Token (non-expiring by default). Create it under Preferences > Development > New Application with scopes `read:search read:statuses read:accounts write:statuses read:follows write:follows write:blocks write:mutes write:favourites write:bookmarks read:bookmarks write:media`. `write:statuses` covers posts (including quotes and polls), threads, replies, reposts and votes. The rest are needed only by the tools that use them: `write:media` by `createSocialPost` and `replyToSocialPost` with `images` (it covers uploading and checking media), `read:follows` by `setAccountRelationship` (it covers `GET /api/v1/accounts/relationships`), `write:follows` by follow and unfollow, `write:blocks` by block and unblock, `write:mutes` by mute and unmute, `write:favourites` by like and unlike, `write:bookmarks` by bookmark and unbookmark, and `read:bookmarks` by `getSocialBookmarks`. A token created without them keeps working for every other tool. To add them later, tick the scopes on the application, save, then use **Regenerate access token** (Mastodon doesn't widen an existing token) and update `MASTODON_ACCESS_TOKEN`.
 * **Auth Header:** `Authorization: Bearer <access-token>` on every request, including endpoints that are also public.
 * **HTML to text (`HtmlText`):** first, when the status has a `quote`, remove every element with the CSS class `quote-inline`, including its content. Mastodon prepends a `<p class="quote-inline">RE: <a …>…</a></p>` fallback link to quote posts for older clients, and its docs tell clients to hide it, because the quote is shown separately. Then `<br>` and `</p><p>` become newlines, and all other tags are removed. The named entities `&amp; &lt; &gt; &quot; &apos; &nbsp;` and all numeric entities (`&#39;`, `&#x27;`) are decoded. The result is trimmed.
 * **Instance domain:** `domain` from `GET /api/v2/instance`, fetched together with the posting rules and cached with them. If that fetch fails, use the host of `social.mastodon.instance-url`.
 * **Fully qualified handles:** a local account's `acct` has no domain (e.g. `alice`). Every Mastodon handle this server returns (`author`, `handle`) is fully qualified: if `acct` contains no `@`, append `@<instance domain>`. The result is then prefixed with `@`, e.g. `@alice@mastodon.social`. Returned handles can therefore be passed back to any tool unchanged.
-* **Post mapping (`PostResult`, used by every tool):** If the status has a non-null `reblog` (a boost), map the `reblog` object instead. `id` → `id`; `account.acct` → `author` (fully qualified); `content` → `text` (via `HtmlText`); `created_at` → `createdAt`; `url` → `url`; `replies_count` → `replyCount`; `reblogs_count` → `repostCount`; `favourites_count` → `likeCount`; `quote` and `poll` as below.
+* **Post mapping (`PostResult`, used by every tool):** If the status has a non-null `reblog` (a boost), map the `reblog` object instead. `id` → `id`; `account.acct` → `author` (fully qualified); `content` → `text` (via `HtmlText`); `created_at` → `createdAt`; `url` → `url`; `replies_count` → `replyCount`; `reblogs_count` → `repostCount`; `favourites_count` → `likeCount`; `quote`, `poll` and `media` as below.
+  * **`media`** ← `status.media_attachments[]` (absent → `[]`), in order: `type` → `type` (`image`, `gifv`, `video`, `audio`, `unknown`; any other value → `unknown`); `url` → `url` (for a remote file not cached by the instance, `url` can be `null`, then use `remote_url`); `preview_url` → `previewUrl`; `description` → `altText` (`null` or blank → `null`).
   * **`quote`** ← `status.quote` (Mastodon 4.4+; absent or `null` → `null`). `quote.state` maps unchanged for `pending`, `accepted`, `rejected`, `revoked`, `deleted` and `unauthorized`. `blocked_account` and `blocked_domain` map to `blocked`, and `muted_account` to `muted`. An unrecognized future state is passed through unchanged. When `quote.quoted_status` is present, it fills `id`, `author`, `text` and `url` with the post mapping, without its own `quote` or `poll`. A `ShallowQuote` carries only `quoted_status_id`, so it fills just `id`, and the other fields are `null`.
   * **`poll`** ← `status.poll` (`null` → `null`). `options[i]` → `{number: i + 1, title, votesCount: options[i].votes_count}` (the count is `null` when hidden). `multiple`, `expired`, `expires_at` → `expiresAt`, `votes_count` → `votesCount`, `voters_count` → `votersCount`, `voted` (`false` when absent) and `own_votes` (0-based) → `ownVotes` (+1 each, `[]` when absent).
   * Caveat: for posts from other servers, the counts reflect only the interactions this instance knows about, so they can be lower than the true totals.
@@ -713,6 +859,7 @@ In this section, `{n}` is the effective limit after clamping (§6.8). The **max*
   * The same response also provides:
     * `api_versions.mastodon` (Mastodon 4.3+) → `quotes` = the value ≥ 7. Quote posts arrived with API version 7 (Mastodon 4.5). If the field is missing, or the fetch fell back, `quotes` = `false`.
     * `configuration.polls.max_options`, `max_characters_per_option`, `min_expiration` and `max_expiration` (seconds) → `polls`. If any is missing, use Mastodon's own defaults from `PollOptionsValidator` and `PollExpirationValidator`: 4 options, 50 graphemes per option, 5 minutes, 1 month (2,629,746 seconds). The minute values are `ceil(min / 60)` and `floor(max / 60)`.
+    * `configuration.statuses.max_media_attachments` → `images.maxImages`; `configuration.media_attachments.image_size_limit` → `maxBytes`; `image_matrix_limit` → `maxPixels`; `description_limit` (Mastodon 4.4+) → `maxAltTextLength`; `supported_mime_types` intersected with the four sniffable types (§6.14) → `mimeTypes`. Missing values use Mastodon's defaults: 4 images, 16,777,216 bytes, 33,177,600 pixels, 1,500 characters, and all four types. `withQuote` = `false` (Mastodon's quote docs: a quote post can't carry media or a poll) and `withPoll` = `false` (`media_ids` and `poll` are mutually exclusive in `POST /api/v1/statuses`).
   * All of these fields are documented in the Mastodon API docs, and `/api/v2/instance` needs no authentication.
 * **Post:** `POST /api/v1/statuses` with header `Idempotency-Key: <random UUID>`, a new UUID per post. If the request fails with a network error or HTTP 5xx, retry it **once with the same key**. Mastodon then returns the already-created status instead of publishing a duplicate. Map the response `id` → `PublishedPost.id` and `url` → `PublishedPost.url` (`cid` = `null`).
   * Top-level post (and the first part of a thread): body `{"status": "<text>", "visibility": "public"}`.
@@ -736,6 +883,16 @@ In this section, `{n}` is the effective limit after clamping (§6.8). The **max*
 * **Poll** (create):
   * `POST /api/v1/statuses` with `{"status": "<content>", "visibility": "public", "poll": {"options": [...], "expires_in": <expiresInMinutes × 60>, "multiple": <bool>, "hide_totals": <bool>}}` plus the usual `Idempotency-Key` and single retry.
   * All §6.12 checks run first, so a 422 from the server means the instance's limits differ from what it reported. Map it through §6.5.
+* **Images** (upload, then post):
+  1. For each `PreparedImage`, in order: `POST /api/v2/media` as `multipart/form-data` with a `file` part (the bytes, with the sniffed `Content-Type` and a filename `image-<i>.<ext>`) and a `description` part (the alt text). Scope `write:media`. `thumbnail` and `focus` aren't sent.
+     * **200** → the `MediaAttachment` is ready (`url` is set). Small images are processed synchronously since Mastodon 4.0.
+     * **202** → the file is still being processed (`url` is `null`; always the case for a GIF, which Mastodon converts to `gifv`). Poll `GET /api/v1/media/{id}` once a second: **206** means still processing, **200** means ready. Stop after `social.media.processing-timeout` (default 30 s) → the Tool 8 upload failure with reason `Mastodon is still processing it`.
+     * **422** (the instance rejected the file, e.g. an unsupported type or a size limit lower than it reported) → the Tool 8 upload failure with the server's `error` text as the reason. The missing-scopes 403 → the §5 missing-scopes message naming `write:media`.
+     * Uploads are not retried, because `POST /api/v2/media` has no idempotency key. Nothing has been posted yet, so the agent can safely call the tool again.
+  2. Create the status as usual (`POST /api/v1/statuses` with the `Idempotency-Key` and single retry), adding `"media_ids": ["<id1>", "<id2>", ...]` in upload order. For a reply, the body also has `in_reply_to_id` and the parent's visibility (§5, **Reply**). With images, `status` may be `""`.
+  * A 422 on the status call that says media aren't ready (a race with processing) → poll the media again, as in step 1, then retry the status once with the **same** `Idempotency-Key`. Any other failure → §6.5.
+  * **Orphans:** media uploaded before a failure are never attached. Mastodon deletes unattached media on its own (its media cleanup job), so the server doesn't call `DELETE /api/v1/media/{id}`.
+  * **Metadata:** Mastodon strips EXIF, including GPS location, and applies the orientation when it processes an upload, so the bytes are sent unchanged (§6.14).
 * **Vote:**
   1. Read the post (above). `status.poll` null → the "has no poll" message.
   2. `poll.voted` → `already-voted`, with `post` mapped from `status` and no write.
@@ -753,7 +910,7 @@ In this section, `{n}` is the effective limit after clamping (§6.8). The **max*
   4. Otherwise `POST /api/v1/accounts/{account.id}/follow` with an empty body (scope `write:follows`). The platform defaults apply: `reblogs=true`, `notify=false`, all languages. The response is a `Relationship`: `following: true` → `following`; `requested: true` → `requested`, with `note` set per Tool 12 (`account.locked` → the approval note; otherwise the account is remote, and the note names the domain from its fully qualified handle). Any other response → `IllegalStateException("Mastodon did not confirm the follow of '<handle>'")`.
   * **Pending requests:** Mastodon's `FollowService` creates a follow *request* instead of a follow when the target is locked, **or** when the target is on another server (a remote ActivityPub account), even if it is unlocked. A remote request normally turns into a follow within seconds, once the other server sends its `Accept`. The tool reports the state at the time of the call and does not wait.
   * **Errors:**
-    * HTTP 403 whose body contains `outside the authorized scopes` → `IllegalStateException("The Mastodon access token lacks the <scopes> scope(s) needed by <tool>. Add them to the application and regenerate the token.")`, where `<scopes>` is `read:follows, write:follows` for follow and unfollow, `read:follows, write:blocks` for block and unblock, `read:follows, write:mutes` for mute and unmute, `write:favourites` for like and unlike, `write:bookmarks` for bookmark and unbookmark, and `read:bookmarks` for `getSocialBookmarks`. `<tool>` names the tool and action, e.g. `setAccountRelationship (block)`. This can happen on the relationships call or on the write call. The same mapping applies to every tool that needs one of these scopes.
+    * HTTP 403 whose body contains `outside the authorized scopes` → `IllegalStateException("The Mastodon access token lacks the <scopes> scope(s) needed by <tool>. Add them to the application and regenerate the token.")`, where `<scopes>` is `read:follows, write:follows` for follow and unfollow, `read:follows, write:blocks` for block and unblock, `read:follows, write:mutes` for mute and unmute, `write:favourites` for like and unlike, `write:bookmarks` for bookmark and unbookmark, `read:bookmarks` for `getSocialBookmarks`, and `write:media` for `createSocialPost` and `replyToSocialPost` with images. `<tool>` names the tool and action, e.g. `setAccountRelationship (block)`. This can happen on the relationships call or on the write call. The same mapping applies to every tool that needs one of these scopes.
     * Any other HTTP 403 from step 4 → `IllegalArgumentException("Mastodon doesn't allow following '<handle>' (the account may have moved, or its server may be blocked)")`. The `FollowService` raises `NotPermittedError` for blocks, a moved target and domain blocks, and the block case was already caught in step 3.
     * HTTP 422 (for example the follow limit: local accounts can follow at most 7,500 accounts, or 1.1 × their follower count if that is higher; the limits are configurable per server) → the §6.5 generic `API error` message, which includes the server's explanation.
   * The follow call is **not** retried automatically (§6.5). Re-running the tool is safe, because step 3 detects a follow that was already created.
@@ -789,7 +946,7 @@ In this section, `{n}` is the effective limit after clamping (§6.8). The **max*
   * The endpoint is idempotent too: if there is no favourite, it returns the status with `favourited: false`.
 * **Reply:**
   * `replyTarget`: read the post (above). The parent is `status.id`. The visibility is `status.visibility`. `mention` is `status.account.acct` exactly as the API returns it (bare for local accounts, `user@domain` for remote ones), or `null` when the author is the configured account. `SocialMcpTools` adds the prefix (Tool 14).
-  * `reply`: `POST /api/v1/statuses` with body `{"status": "<text>", "in_reply_to_id": "<parent id>", "visibility": "<parent visibility>"}`. Use the same `Idempotency-Key` and single retry on network errors or 5xx as for posts (above). Map the response as for posts (`url`).
+  * `reply`: `POST /api/v1/statuses` with body `{"status": "<text>", "in_reply_to_id": "<parent id>", "visibility": "<parent visibility>"}`, plus `media_ids` when images are attached (§5, **Images**). Use the same `Idempotency-Key` and single retry on network errors or 5xx as for posts (above). Map the response as for posts (`url`).
   * Length: the mention prefix counts as `@user` only (§6.2), so a long remote domain costs nothing extra.
 * **Repost (boost):**
   1. Read the post. `status.reblogged` is `true` → `already-reposted`, with no write.
@@ -814,7 +971,11 @@ In this section, `{n}` is the effective limit after clamping (§6.8). The **max*
   4. Session access must be thread-safe.
   5. Login errors: HTTP 401 `AuthenticationRequired` (wrong handle or password) → `IllegalStateException("Bluesky login failed: check BLUESKY_HANDLE and BLUESKY_APP_PASSWORD")`. `AuthFactorTokenRequired` means the account password was used on an account with email 2FA → `IllegalStateException("Bluesky login needs a second factor: use an app password (Settings > Privacy and security > App passwords)")`. `AccountTakedown` → `IllegalStateException("Bluesky account is taken down")`. Never retry a failed login automatically, because of the rate limit.
   6. Every request below, reads and writes alike, sends `Authorization: Bearer <accessJwt>`, and the refresh-and-retry in step 3 applies to all of them.
-* **Post mapping (`PostResult`, from a `postView`):** `uri` → `id`; `author.handle` → `author` (prefixed `@`); `record.text` → `text`; `record.createdAt` → `createdAt`; `url` = `https://bsky.app/profile/{author.handle}/post/{rkey}`, where `rkey` is the last path segment of `uri`; `replyCount`, `repostCount`, `likeCount` → the same names; `poll` = `null` (Bluesky has no polls); `quote` as below.
+* **Post mapping (`PostResult`, from a `postView`):** `uri` → `id`; `author.handle` → `author` (prefixed `@`); `record.text` → `text`; `record.createdAt` → `createdAt`; `url` = `https://bsky.app/profile/{author.handle}/post/{rkey}`, where `rkey` is the last path segment of `uri`; `replyCount`, `repostCount`, `likeCount` → the same names; `poll` = `null` (Bluesky has no polls); `quote` and `media` as below.
+  * **`media`** ← the media part of `postView.embed`: the embed itself for `app.bsky.embed.images#view`, `app.bsky.embed.gallery#view` or `app.bsky.embed.video#view`, or `.media` of an `app.bsky.embed.recordWithMedia#view`. Otherwise (no embed, a plain quote, an external link card) → `[]`.
+    * `images#view` → one item per `images[]`: `type` = `image`, `url` = `fullsize`, `previewUrl` = `thumb`, `altText` = `alt` (blank → `null`).
+    * `gallery#view` → one item per `items[]` whose `$type` is `#viewImage`, mapped the same way, with `previewUrl` = `thumbnail`. Unknown item types are skipped.
+    * `video#view` → one item: `type` = `video`, `url` = `playlist`, `previewUrl` = `thumbnail`, `altText` = `alt`.
   * **`quote`** ← `postView.embed` when its `$type` is `app.bsky.embed.record#view`, or `app.bsky.embed.recordWithMedia#view` (use its `.record`). Otherwise `null`. The embed's `record`:
     * `#viewRecord` whose `value.$type` is `app.bsky.feed.post` → `state: "accepted"`, `id` = `uri`, `author` = `@` + `author.handle`, `text` = `value.text`, and `url` built as for posts;
     * `#viewNotFound` → `deleted`; `#viewBlocked` → `blocked`; `#viewDetached` → `detached` (the quoted author removed the quote with a postgate); the other fields are `null`;
@@ -873,7 +1034,19 @@ In this section, `{n}` is the effective limit after clamping (§6.8). The **max*
     ```
   * Bluesky has no per-post visibility setting, so every part is public and `followUpVisibility` is `null`.
   * If the session expires mid-thread, the §5 session refresh-and-retry applies to the failed part only. A failed `createRecord` creates nothing, so the retry can't duplicate a part.
-* **Posting rules:** fixed by the `app.bsky.feed.post` lexicon: `maxLength` = 300, `unit` = `"graphemes"`, `maxBytes` = 3000 (UTF-8), `urlLength` = `null` (URLs count at their full length, because this server doesn't generate link facets), `source` = `"fixed"`, `quotes` = `true`, `polls` = `null`.
+* **Posting rules:** fixed by the `app.bsky.feed.post` lexicon: `maxLength` = 300, `unit` = `"graphemes"`, `maxBytes` = 3000 (UTF-8), `urlLength` = `null` (URLs count at their full length, because this server doesn't generate link facets), `source` = `"fixed"`, `quotes` = `true`, `polls` = `null`. `images`:
+  * `maxImages` = 4 (`app.bsky.embed.images`).
+  * `maxBytes` = `social.bluesky.max-image-bytes` (default 2,000,000, the lexicon's `maxSize`), lowered to the PDS's `blobUploadLimit` when that is smaller (below).
+  * `maxPixels` = `null`: the protocol has no pixel limit.
+  * `recommendedMaxDimension` = 4000: the official app downscales to fit 4000 × 4000 (raised from 2000 × 2000 in April 2026). It is a suggestion, not a rule.
+  * `maxAltTextLength` = 2000, the official app's limit (the lexicon sets none).
+  * `mimeTypes` = the four sniffable types (the lexicon accepts `image/*`).
+  * `withQuote` = `true`, `withPoll` = `false`.
+* **Image limits from the PDS:** Bluesky has no instance-configuration endpoint like Mastodon's. The image limit is a protocol constant in the lexicon, checked by the PDS when the post record is created. The PDS does report one related value:
+  * `GET /xrpc/com.atproto.server.describeServer` on `social.bluesky.pds-url` (no authentication). Its optional `blobUploadLimit` is "the maximum size of a blob that can be uploaded via `uploadBlob`, in bytes". It is a general limit sized for video (300 MB by default on the reference PDS), so it only matters on a PDS configured with something unusually small.
+  * `maxBytes` = min(`social.bluesky.max-image-bytes`, `blobUploadLimit`), and `images.source` = `"lexicon+server"`. When the field is absent or the call fails, use `social.bluesky.max-image-bytes` alone, with `images.source` = `"lexicon"`, and log a warning when it failed.
+  * Fetch lazily on first use and cache it for the life of the process. After a failure, retry at most once per 10 minutes, as for the Mastodon instance fetch. A failure never blocks posting.
+  * The lexicon itself isn't fetched at runtime. Lexicon resolution (`_lexicon` DNS record → `com.atproto.lexicon.schema` record) would give the latest published schema, not the version the user's PDS enforces.
 * **Reading a post for an action** (used by quote, reply and every `setPostAction` action): resolve the reference to an AT URI (§6.9), then `GET /xrpc/app.bsky.feed.getPosts?uris={uri}` (max 25 URIs, one used here) → `posts[0]` (`postView`). An empty `posts` array → the Tool 5 not-found message: the AppView leaves out posts that were deleted or that a block hides. Bluesky feed items have no separate repost id, and a `PostResult.id` always names the original post (§5 timeline mapping), so no unwrapping is needed.
 * **Quote** (`quoteTarget`, then the post):
   1. Read the post (above).
@@ -887,6 +1060,17 @@ In this section, `{n}` is the effective limit after clamping (§6.8). The **max*
      ```
      There is no approval step: the quote is live immediately, and there's no caveat. The quoted author can later detach it, which is out of scope.
   * The embed doesn't count toward the 300-grapheme text limit.
+* **Images** (upload, then post):
+  1. For each `PreparedImage`, in order: `POST /xrpc/com.atproto.repo.uploadBlob` with the raw bytes as the body and `Content-Type` = the sniffed MIME type (not multipart). The response is `{"blob": {"$type": "blob", "ref": {"$link": "<cid>"}, "mimeType": "...", "size": n}}`. Keep the `blob` object exactly as returned, since it goes into the record unchanged. The §5 session refresh-and-retry applies. A repeated upload of the same bytes gives the same blob, so the retry is harmless.
+  2. Build the embed. Each image is `{"image": <blob>, "alt": "<alt text>", "aspectRatio": {"width": w, "height": h}}`, with `w` and `h` from `PreparedImage`, i.e. after EXIF orientation. `aspectRatio` is optional in the lexicon, but without it clients show the image cropped to a square until it loads.
+     * Images only: `"embed": {"$type": "app.bsky.embed.images", "images": [ ... ]}`.
+     * Images and a quote: `"embed": {"$type": "app.bsky.embed.recordWithMedia", "record": {"$type": "app.bsky.embed.record", "record": {"uri": ..., "cid": ...}}, "media": {"$type": "app.bsky.embed.images", "images": [ ... ]}}`, which replaces the plain `app.bsky.embed.record` embed of **Quote**. The `embeddingDisabled` check of **Quote** still applies.
+  3. `createRecord` as for a top-level post or a reply (§5 **Post** and **Reply**), with the embed added to the record. With images, `text` may be `""`, because the lexicon requires the field but not a length.
+  * **Limits:** the PDS checks a blob's size and type against the lexicon when the record that uses it is created, not at upload, so a rejected image surfaces as a `createRecord` error (through §6.5). The server's own §6.14 checks prevent this. `social.bluesky.max-image-bytes` exists because a self-hosted PDS still on the old lexicon allows only 1,000,000 bytes (the limit rose to 2 MB in April 2026), and no API reports that. Such users set it to `1000000`.
+  * **Old-PDS hint:** if `createRecord` for a post with images fails with HTTP 400 and any image is over 1,000,000 bytes, the §6.5 message gets the suffix `" Your PDS may still enforce the older 1 MB image limit; set BLUESKY_MAX_IMAGE_BYTES=1000000, or resize the images below 1 MB."`. The blobs are left for the PDS to discard, and nothing was posted.
+  * **Orphans:** a blob that no record references within a few minutes is deleted by the PDS, so a failure after upload leaves nothing behind.
+  * **Metadata:** the PDS stores and serves the uploaded bytes unchanged (`com.atproto.sync.getBlob` returns the original file), so EXIF data such as GPS location would be public. `ImageLoader` strips it first (§6.14).
+  * **Why not `app.bsky.embed.gallery`:** it allows up to 10 images, but it is new (Bluesky app 1.123, mid-2026) and third-party clients that predate it don't render it. `app.bsky.embed.images` works everywhere, so the limit stays 4. Supporting galleries later means only raising `maxImages` and choosing the embed by count.
 * **Polls and votes:** not supported. `createSocialPost` with `poll`, and `voteInSocialPoll`, fail with `"Bluesky doesn't support polls"` before any HTTP call.
 * **Max length:** 300 graphemes **and** 3000 UTF-8 bytes (§6.2).
 * **Follow:**
@@ -979,7 +1163,7 @@ In this section, `{n}` is the effective limit after clamping (§6.8). The **max*
   * Idempotent, so the session retry is safe. The same duplicate-record caveat as for unfollow applies.
 * **Reply:**
   * `replyTarget`: read the post. `parent` = `{uri: postView.uri, cid: postView.cid}`. `root` = `postView.record.reply.root` (a strong ref) if the parent is itself a reply, otherwise `parent`. `viewer.replyDisabled: true` → the Tool 14 "restricted who can reply" message. `mention` is always `null`, because Bluesky notifies the parent's author without a mention.
-  * `reply`: `createRecord` in `app.bsky.feed.post` exactly as for a thread part (§5 Post), with `reply: {root, parent}` from the target. The `url` is built the same way.
+  * `reply`: `createRecord` in `app.bsky.feed.post` exactly as for a thread part (§5 Post), with `reply: {root, parent}` from the target, plus an `app.bsky.embed.images` embed when images are attached (§5, **Images**). The `url` is built the same way.
   * Both fields are required by the lexicon's `replyRef`. Using the parent as the root for a reply deep in a thread would detach the reply from the thread in clients, so the root must come from the parent's own `reply` field.
   * A threadgate can also change after `getPosts`. If `createRecord` is rejected for that reason, the error surfaces through §6.5.
 * **Repost:**
@@ -1014,7 +1198,7 @@ In this section, `{n}` is the effective limit after clamping (§6.8). The **max*
    * Service beans are always registered. Each service checks `isConfigured()` at call time.
    * Unknown platform string → `IllegalArgumentException("Unknown platform '<value>'. Use one of: mastodon, bluesky")`.
    * Any tool on an unconfigured platform → `IllegalArgumentException("Platform <name> is not configured")`.
-2. **Length measurement (`checkPart`)** — shared by `createSocialPost`, `checkSocialPost`, `createSocialThread` and `replyToSocialPost`, so all four always agree. It is applied to the final text, including any numbering suffix or reply mention prefix. An embedded quote and a poll are not part of the text and don't count. Rejections happen before any posting call. The only network call that may happen first is the Mastodon instance-limits fetch (§5).
+2. **Length measurement (`checkPart`)** — shared by `createSocialPost`, `checkSocialPost`, `createSocialThread` and `replyToSocialPost`, so all four always agree. It is applied to the final text, including any numbering suffix or reply mention prefix. An embedded quote, a poll and images (including their alt text) are not part of the text and don't count. Rejections happen before any posting call. The only network call that may happen first is the Mastodon instance-limits fetch (§5).
    * **Mastodon (`maxLength` from the instance, fallback 500):** This mirrors Mastodon's own `StatusLengthValidator`, which counts grapheme clusters.
      1. Rewrite the text: replace each URL that has an `http://` or `https://` scheme (`https?://\S+`) with `urlLength` placeholder characters (usually 23). Replace each remote mention `@user@domain` with `@user`. URLs without a scheme are not shortened.
      2. Count extended grapheme clusters in the rewritten text with `java.text.BreakIterator.getCharacterInstance()`, the same method as Bluesky.
@@ -1022,7 +1206,7 @@ In this section, `{n}` is the effective limit after clamping (§6.8). The **max*
    * Never use `String.length()` directly. It counts UTF-16 code units, which over-counts emoji.
    * A blank text (empty or only whitespace) always fails with `reason: "blank"`.
 3. **Write kill switch:** `social.posting-enabled=false` disables every tool that changes anything on a platform, so an operator can run the server read-only:
-   * `createSocialPost` (with or without a quote or poll), `createSocialThread` and `replyToSocialPost` throw `IllegalStateException("Posting is disabled")`.
+   * `createSocialPost` (with or without a quote, poll or images), `createSocialThread` and `replyToSocialPost` throw `IllegalStateException("Posting is disabled")`. No image is read, downloaded or uploaded.
    * `setAccountRelationship` and `setPostAction` throw `IllegalStateException("<Action> is disabled")`, naming the requested action: `Following`, `Unfollowing`, `Blocking`, `Unblocking`, `Muting`, `Unmuting`, `Liking`, `Unliking`, `Reposting`, `Unreposting`, `Bookmarking` or `Unbookmarking`.
    * `voteInSocialPoll` throws `IllegalStateException("Voting is disabled")`.
    * Bookmarks and mutes are private, but they still change the account's state, so they're covered too. Reading bookmarks (`getSocialBookmarks`) is not a write and keeps working.
@@ -1033,7 +1217,7 @@ In this section, `{n}` is the effective limit after clamping (§6.8). The **max*
    * Upstream HTTP errors (`RestClientResponseException`) that aren't mapped to a specific message elsewhere in this spec → `IllegalStateException("<platform> API error <status>: <short body excerpt>")`.
    * Network failures (`ResourceAccessException`) → `IllegalStateException("<platform> is unreachable: <cause message>")`.
    * Credentials are never included in any message.
-   * Apart from the Mastodon post retry and the Bluesky session refresh-and-retry (§5), requests are not retried automatically. This includes every relationship change, post action and vote. Each of those checks the current state first, so the agent can safely call the tool again.
+   * Apart from the Mastodon post retry, the Mastodon media-processing poll and the Bluesky session refresh-and-retry (§5), requests are not retried automatically. Image uploads and URL downloads are not retried. This includes every relationship change, post action and vote. Each of those checks the current state first, so the agent can safely call the tool again.
 6. **Secrets:** Tokens and passwords must never be logged or appear in exception messages.
 7. **Handle normalization and validation** (in `SocialMcpTools`, before any network call). Trim the handle and strip one leading `@`, then validate it with the platform's `isValidHandle`:
 
@@ -1062,7 +1246,7 @@ In this section, `{n}` is the effective limit after clamping (§6.8). The **max*
      * Anything else → `IllegalArgumentException("Invalid bluesky post reference '<value>'")`.
    * Validation failures make no HTTP call.
 10. **Thread parts and numbering** (in `SocialMcpTools`, identical for `checkSocialPost` and `createSocialThread`):
-    * `parts` must be a non-null array with at least 1 item. Otherwise → `IllegalArgumentException("parts must contain at least one item")`.
+    * `parts` must be a non-null array with at least 1 item. Otherwise → `IllegalArgumentException("parts must contain at least one item")`. The one exception: `checkSocialPost` may omit `parts` (`null`) when `images` is non-empty. An empty `parts` array is always rejected.
     * Part count limit: `social.thread.max-parts` (default 10, allowed range 2–25). `checkSocialPost` reports excess parts as a problem. `createSocialThread` rejects them before posting.
     * Each part is trimmed of leading and trailing whitespace. Internal line breaks are kept.
     * If `numbered` is `true` (the default) and there are 2 or more parts, append the suffix `" (i/N)"` to each part after trimming, where `i` is the 1-based position and `N` is the part count, e.g. `"…end of paragraph. (2/5)"`. The suffix counts toward the length limit.
@@ -1082,6 +1266,45 @@ In this section, `{n}` is the effective limit after clamping (§6.8). The **max*
     * `multiple` and `hideTotals` default to `false`.
     * Every problem is detected before posting. The first one found is reported, in the order above.
 13. **`choices` handling** (in `SocialMcpTools`, for `voteInSocialPoll`): must be non-null and non-empty, have no duplicates, and contain only numbers ≥ 1. Otherwise → the Tool 16 "distinct option numbers" message, with no HTTP call. The upper bound and the single-choice rule need the poll, so the service checks those after reading it.
+14. **Image handling** (in `SocialMcpTools` and `ImageLoader`, for the `images` parameter of `createSocialPost`, `replyToSocialPost` and `checkSocialPost`, using `postingRules().images`). It runs after the kill switch and the platform check, and every image is fully checked before the first upload. The posting tools report the first problem found, image by image, in the order below. `checkSocialPost` reports all of them without throwing (Tool 10). `<i>` is the image's 1-based position. Messages may repeat the `source` the agent gave, but never file contents.
+    1. **Shape:** `null` or `[]` means no images. More than `maxImages` items → `IllegalArgumentException("At most <maxImages> images per post on <platform>")`. A blank `source` → `IllegalArgumentException("Image <i> needs a source")`. A blank `altText` → `IllegalArgumentException("Image <i> needs alt text describing what it shows")`.
+    2. **Combinations** (`createSocialPost` only): with `poll` → the Tool 8 "images or a poll" message; with `quote` where `withQuote` is `false` → the Tool 8 "Mastodon doesn't allow images in a quote post" message. Both are checked before any file is read.
+    3. **Alt text:** trimmed, then measured in graphemes with the §6.2 `BreakIterator` method. Over `maxAltTextLength` → `IllegalArgumentException("Image <i> alt text is <reason>")`, with the §6.2 reason format, e.g. `"1620/1500 graphemes (120 over)"`.
+    4. **Source:** after trimming:
+       * `https://…` → download (below). `http://` and any other scheme → `IllegalArgumentException("Image <i>: only https:// URLs are allowed")`.
+       * `file:` URI → converted to a path, then treated as a local file.
+       * An absolute path (`Path.isAbsolute()` on the server's OS) → a local file. Anything else, including a relative path → `IllegalArgumentException("Image <i>: '<source>' must be an absolute file path or an https:// URL")`. Relative paths are rejected because the server's working directory is not the agent's.
+    5. **Local file:** resolve it with `toRealPath()` (following links). Missing → `IllegalArgumentException("Image <i>: file '<source>' not found")`.
+       * **Sandbox paths:** when the missing path looks like a location inside an assistant's sandbox rather than on the user's computer, the message is instead `IllegalArgumentException("Image <i>: '<source>' is inside the assistant's sandbox (for example an image attached to the chat), not on the computer running this server. Give the image's path on your computer, or use Claude Code, which works with your files directly.")`.
+       * A path matches when it starts with `/mnt/user-data/`, `/mnt/data/`, `/sessions/` or `/tmp/outputs/`, or, when the server runs on Windows, when it is any `/`-rooted Unix path (which can't exist there).
+       * These prefixes are a best guess: clients don't document their sandbox paths, so the list is kept in one constant, easy to extend.
+       * The check runs only when the file is missing, so a real file at a matching path on Linux is read normally. Not a regular file or not readable → `IllegalArgumentException("Image <i>: '<source>' is not a readable file")`. If `social.media.allowed-dirs` is non-empty and the real path isn't inside one of those directories → `IllegalArgumentException("Image <i>: '<source>' is outside the directories this server may read images from")`. Read at most `social.media.max-read-bytes` + 1 bytes; more → `IllegalArgumentException("Image <i> is larger than <max-read-bytes> bytes")`.
+    6. **URL download** (Java `HttpClient`, not the platform clients):
+       * Disabled with `social.media.allow-urls=false` → `IllegalArgumentException("Image <i>: downloading images from URLs is disabled on this server")`.
+       * No credentials or platform headers are ever sent.
+       * Every address the host resolves to must be public: loopback, link-local, site-local (private), unique-local IPv6 (`fc00::/7`), any-local and multicast addresses → `IllegalArgumentException("Image <i>: '<host>' is a private or local address")`. This keeps an injected prompt from using the server to reach the user's local network.
+       * Redirects are followed by the server, at most 3, and each target must also be `https://` and pass the address check.
+       * Timeouts: 10 s to connect, and `social.media.download-timeout` (default 30 s) for the whole download.
+       * A non-2xx status → `IllegalArgumentException("Image <i>: download failed with HTTP <status>")`. A network error → `IllegalArgumentException("Image <i>: download failed: <cause>")`.
+       * The body is read up to `social.media.max-read-bytes` + 1 bytes, with the same "larger than" message. `Content-Type` is ignored.
+    7. **Type:** sniffed from the first bytes, never from the file name or `Content-Type`:
+       * JPEG: `FF D8 FF`.
+       * PNG: `89 50 4E 47 0D 0A 1A 0A`.
+       * GIF: `GIF87a` or `GIF89a`.
+       * WebP: `RIFF`, four bytes, then `WEBP`.
+       * Anything else → `IllegalArgumentException("Image <i> is not a JPEG, PNG, GIF or WebP image. Convert it to JPEG.")` (the common case is an iPhone HEIC photo).
+       * A type missing from `mimeTypes` → `IllegalArgumentException("Image <i> is <mime type>, which <platform> doesn't accept")`.
+       * Sniffing is also a safety check: a text file, key or document given as a `source` is rejected before anything leaves the machine.
+    8. **Dimensions:** read from the header without decoding pixels: the JPEG `SOFn` marker, PNG `IHDR`, the GIF logical screen descriptor, or the WebP `VP8 `/`VP8L`/`VP8X` chunk. For a JPEG whose EXIF orientation is 5–8, width and height are swapped. A header that can't be read → `IllegalArgumentException("Image <i> is damaged or truncated")`. `width × height` over `maxPixels` → `IllegalArgumentException("Image <i> is <w>×<h> (<w·h> pixels); the maximum on <platform> is <maxPixels> pixels")`.
+    9. **Metadata stripping** (Bluesky only, since Mastodon strips it when processing, §5). The steps below are lossless: pixel data is never decoded or re-encoded.
+       * **JPEG:** remove `APP1` (EXIF, XMP), `APP13` (IPTC/Photoshop) and `COM` segments. Keep every other segment, including `APP0` (JFIF), `APP2` (ICC colour profile) and `APP14` (Adobe). If the EXIF orientation was not 1, insert one minimal `APP1` EXIF segment after `SOI`/`APP0` that holds only IFD0 tag `0x0112` (Orientation) with the original value, so the photo isn't shown sideways.
+       * **PNG:** remove the `eXIf`, `tEXt`, `zTXt`, `iTXt` and `tIME` chunks.
+       * **WebP:** remove the `EXIF` and `XMP ` chunks, clear the matching flag bits in `VP8X`, and fix the RIFF size.
+       * **GIF:** sent unchanged, because GIF has no EXIF block.
+       * This removes GPS location, camera serial numbers and similar data that the PDS would otherwise publish.
+    10. **Size:** after stripping, more than `maxBytes` → `IllegalArgumentException("Image <i> is <n> bytes; the maximum on <platform> is <maxBytes> bytes. Resize or recompress it and try again.")`.
+    * The server never resizes, recompresses or converts an image. It rejects anything over a limit with a message that names the limit, and the agent fixes the image (for example with an image tool) and calls again.
+    * Logs record each image's source, type, size and dimensions, never its bytes or alt text.
 
 ---
 
@@ -1098,6 +1321,8 @@ spring.main.banner-mode=off
 spring.ai.mcp.server.stdio=true
 spring.ai.mcp.server.name=social-mcp-server
 spring.ai.mcp.server.version=0.0.1
+# The §4 "Server instructions" text, verbatim, on one line
+spring.ai.mcp.server.instructions=Social posting workflows. Text: never count characters yourself; ...
 logging.console.enabled=false
 logging.file.name=${SOCIAL_MCP_LOG_FILE:${java.io.tmpdir}/social-mcp-server.log}
 
@@ -1108,6 +1333,17 @@ social.read.default-limit=${SOCIAL_READ_DEFAULT_LIMIT:10}
 social.read.max-limit=${SOCIAL_READ_MAX_LIMIT:40}
 # Maximum parts in one thread (allowed range 2-25)
 social.thread.max-parts=${SOCIAL_THREAD_MAX_PARTS:10}
+
+# --- Images (§6.14) ---
+# Comma-separated directories images may be read from; empty = any file the process can read
+social.media.allowed-dirs=${SOCIAL_MEDIA_ALLOWED_DIRS:}
+# false = only local files are accepted
+social.media.allow-urls=${SOCIAL_MEDIA_ALLOW_URLS:true}
+# Largest file read or downloaded before any platform limit is applied (20 MiB)
+social.media.max-read-bytes=${SOCIAL_MEDIA_MAX_READ_BYTES:20971520}
+social.media.download-timeout=${SOCIAL_MEDIA_DOWNLOAD_TIMEOUT:30s}
+# How long to wait for Mastodon to finish processing an upload
+social.media.processing-timeout=${SOCIAL_MEDIA_PROCESSING_TIMEOUT:30s}
 
 # --- Mastodon ---
 social.mastodon.instance-url=${MASTODON_INSTANCE_URL:https://mastodon.social}
@@ -1121,6 +1357,8 @@ social.mastodon.thread-visibility=${MASTODON_THREAD_VISIBILITY:unlisted}
 social.bluesky.pds-url=${BLUESKY_PDS_URL:https://bsky.social}
 social.bluesky.handle=${BLUESKY_HANDLE:}
 social.bluesky.app-password=${BLUESKY_APP_PASSWORD:}
+# Largest image blob; set 1000000 for a self-hosted PDS on the pre-April-2026 lexicon
+social.bluesky.max-image-bytes=${BLUESKY_MAX_IMAGE_BYTES:2000000}
 ```
 
 `logging.console.enabled=false` is the Spring Boot 4 switch that removes the console appender. (An empty `logging.pattern.console` also keeps stdout clean, but Logback then prints an "Empty or null pattern" error to stderr.)
@@ -1131,6 +1369,10 @@ Startup validation (Bean Validation via `spring-boot-starter-validation`: `@Vali
 * `social.mastodon.thread-visibility` must be `unlisted` or `public`.
 * `social.thread.max-parts` must be between 2 and 25.
 * `social.read.max-limit` must be between 1 and 100, and `social.read.default-limit` must be between 1 and `social.read.max-limit`.
+* `social.bluesky.max-image-bytes` must be between 1 and 2,000,000 (the lexicon maximum).
+* `social.media.max-read-bytes` must be between 1 and 104,857,600 (100 MiB).
+* Every `social.media.allowed-dirs` entry must be an absolute path. A directory that doesn't exist is only logged as a warning, because it may be mounted later.
+* `social.media.download-timeout` and `social.media.processing-timeout` must be between 1 s and 5 min.
 
 Any other value fails startup with a clear message. This is the only case where configuration stops the app from starting; missing credentials never do (§6.1).
 
@@ -1210,8 +1452,28 @@ Test configuration (`src/test/resources/application.properties`) sets `spring.ai
   * With `numbered=true` and 3 parts, each `parts[].text` ends in `" (i/3)"` and `length` includes the suffix. With `numbered=false`, there is no suffix. A single part is never numbered.
   * A part that fits only without its suffix is reported as over the limit when `numbered=true`.
   * Blank parts, over-long parts and too many parts produce `valid: false` with the right `problems`. None of these throw, and no posting call is made.
-  * Empty or missing `parts` throws the §6.10 message.
+  * Empty or missing `parts` throws the §6.10 message, except that a missing `parts` with non-empty `images` checks only the images (`parts: []`).
   * The tool works with `posting-enabled=false`.
+* **checkSocialPost with `images`:**
+  * No platform upload or posting call is ever made (`MockRestServiceServer` sees only the posting-rules fetches). It works with `posting-enabled=false`.
+  * The Tool 10 example: on Bluesky, a 4032×3024 JPEG of 4,718,592 bytes → `ok: false`, the byte problem, and `fitWithin` 2490×1867. A HEIC file → `mimeType: null`, the "Convert it to JPEG" problem, and `fitWithin: null`. A valid PNG → `ok: true`. `valid` is `false`, and the top-level `problems` holds both messages with their `Image <i>` prefixes and no final period.
+  * Mastodon (`maxPixels` 33,177,600): an 8064×6048 JPEG under 16 MiB → one pixel problem and `fitWithin` 6651×4988, with no byte problem. The same image on Bluesky gets `fitWithin` from `recommendedMaxDimension` or the byte estimate, whichever is smaller.
+  * An image with both a byte and a pixel problem lists both, and `fitWithin` uses the smaller scale.
+  * An image that fits every limit but is larger than `recommendedMaxDimension` is `ok`, with `fitWithin: null`.
+  * `bytes` on Bluesky is after metadata stripping: a JPEG whose EXIF puts it just over `maxBytes` is `ok` once stripped.
+  * A missing `altText` → the problem `"needs alt text describing what it shows"`, and the rest of the image is still checked. A missing file → a problem with `mimeType`, `bytes`, `width` and `height` all `null`, and nothing thrown.
+  * 5 images on Bluesky → the top-level count problem, and all 5 are checked.
+  * A posting call with the same images fails on the same first problem that `checkSocialPost` lists first (shared `ImageLoader.inspect`).
+* **Agent guidance:**
+  * The `initialize` response carries the §4 server instructions verbatim.
+  * The `createSocialPost` and `replyToSocialPost` descriptions, and their `images` parameter descriptions, each name `checkSocialPost`. The `getSocialPostingRules` description says the image limits are for planning. The `checkSocialPost` description mentions images. These are checked with a `tools/list` in the end-to-end test.
+* **Client support:**
+  * A missing `/mnt/user-data/uploads/beach.jpg` → the sandbox message, which names Claude Code. The same holds for `/sessions/abc/mnt/tour/a.jpg`.
+  * With the server's OS stubbed as Windows, a missing `/home/me/a.jpg` → the sandbox message. On Linux, the same missing path → the plain "not found" message.
+  * An existing file under a matching prefix (in a temp directory standing in for `/mnt/data/`, through an injectable root) is read normally.
+  * `checkSocialPost` reports the sandbox message as an image problem, without throwing.
+  * The server instructions and both `images` parameter descriptions tell the model that attached images can't be posted, to ask for a path, and to suggest Claude Code when it can't resize (checked through `tools/list` and `initialize` in the end-to-end test).
+* **Bluesky old-PDS hint:** a `createRecord` HTTP 400 on a post with a 1,500,000-byte image → the §6.5 message ending with the `BLUESKY_MAX_IMAGE_BYTES=1000000` hint. With every image under 1,000,000 bytes → no hint.
 * **createSocialThread:**
   * Mastodon, 3 parts: three sequential `POST /api/v1/statuses` calls. Part 1 has `visibility: public` and no `in_reply_to_id`. Parts 2 and 3 have `visibility: unlisted` and `in_reply_to_id` set to the previous part's `id`. Each request has a distinct `Idempotency-Key`. With `social.mastodon.thread-visibility=public`, parts 2 and 3 are `public`.
   * Bluesky, 3 parts: three sequential `createRecord` calls. Part 1 has no `reply`. Part 2 has `root` = `parent` = part 1's `{uri, cid}`. Part 3 has `root` = part 1 and `parent` = part 2.
@@ -1384,6 +1646,45 @@ Test configuration (`src/test/resources/application.properties`) sets `spring.ai
   * A 422 "already voted" on the vote call → a re-read, then `already-voted`.
   * Bluesky → "Bluesky doesn't support polls", with no HTTP call. `posting-enabled=false` → "Voting is disabled", with no HTTP call.
 * **Posting rules `quotes` / `polls`:** Mastodon reports `polls` from the instance and `quotes` from `api_versions`. Bluesky reports `quotes: true, polls: null`.
+* **Posting rules `images`:**
+  * Mastodon reads `max_media_attachments`, `image_size_limit`, `image_matrix_limit`, `description_limit` and `supported_mime_types` from the instance. An instance without `description_limit` (before 4.4), or a fallback, uses the §5 defaults. `supported_mime_types` without `image/webp` drops WebP from `mimeTypes`. `withQuote` and `withPoll` are `false`.
+  * Bluesky reports 4 images, `maxPixels: null`, `recommendedMaxDimension: 4000`, `maxAltTextLength: 2000`, `withQuote: true`, `withPoll: false`. Mastodon reports `recommendedMaxDimension: null`.
+  * Bluesky `maxBytes`:
+    * `describeServer` with `blobUploadLimit: 314572800` → 2,000,000 with `source: "lexicon+server"`.
+    * `blobUploadLimit: 500000` → 500,000.
+    * No `blobUploadLimit` → 2,000,000 with `source: "lexicon"`.
+    * HTTP 500 → 2,000,000 with `source: "lexicon"`, a logged warning, and a retry only after the 10-minute backoff.
+    * `describeServer` is called once across repeated calls, and without an `Authorization` header.
+    * `social.bluesky.max-image-bytes=1000000` → 1,000,000.
+* **Image loading (`ImageLoader`, no platform calls):**
+  * Sniffing: a JPEG, PNG, GIF and WebP fixture each give the right type and dimensions. A `.png` file that is really a JPEG is sent as `image/jpeg`. A text file named `photo.jpg` → "is not a JPEG, PNG, GIF or WebP image".
+  * A JPEG with EXIF orientation 6 and a 4000×3000 `SOF0` reports 3000×4000.
+  * Stripping (Bluesky): a JPEG with GPS EXIF, XMP and an ICC profile comes out with no `APP1` except a minimal orientation-only one, the ICC `APP2` kept, and entropy-coded data byte-identical. A PNG loses `eXIf`/`tEXt`/`iTXt`/`zTXt`/`tIME` and keeps every other chunk in order. A WebP loses `EXIF`/`XMP ` chunks, has its `VP8X` flags cleared and its RIFF size fixed. All three still decode with `ImageIO` (JPEG, PNG) or pass a header re-parse (WebP). On Mastodon, the same JPEG is sent byte-identical.
+  * Sources: a relative path, `http://` and `ftp://` are rejected. A `file:` URI works. A missing file, a directory, and a file outside `allowed-dirs` (including through a symlink that points outside) give their messages.
+  * `max-read-bytes` + 1 bytes are rejected without reading the whole file.
+  * URLs, against a local test HTTP server: a 200 with an image body loads. A 404 gives the HTTP status message. A redirect to `http://` is rejected. More than 3 redirects are rejected. A body larger than `max-read-bytes` is cut off and rejected. With `allow-urls=false`, no connection is made. A host resolving to `127.0.0.1`, `10.0.0.1`, `169.254.169.254` or `::1` is rejected (tests use an injectable resolver, because the test server itself is local). No `Authorization` header is ever sent.
+  * Alt text: blank → "needs alt text". 1501 graphemes on a 1500 limit → the "alt text is 1501/1500 graphemes (1 over)" message.
+  * Limits: 5 images on a 4-image platform, a 16,777,217-byte file on Mastodon, a 2,000,001-byte file on Bluesky (after stripping), and a 6000×6000 image with `maxPixels` 33,177,600 are each rejected before any upload.
+  * Order: with image 1 valid and image 2 invalid, the error names image 2, and no upload is made for either.
+* **createSocialPost / replyToSocialPost with `images`:**
+  * Mastodon:
+    * 2 images → two `POST /api/v2/media` multipart requests in order, each with `file` (sniffed `Content-Type`) and `description` = the trimmed alt text. Then one `POST /api/v1/statuses` with `media_ids` = both ids in order, `visibility: public` and an `Idempotency-Key`.
+    * A 202 upload → `GET /api/v1/media/<id>` polled (206, 206, 200 with the injected clock and sleeper), then the status is posted. Still 206 at `processing-timeout` → the "still processing" upload failure, and no status call.
+    * A 422 on the second upload → the "Image 2 of 2 could not be uploaded … Nothing was posted" message, and no status call.
+    * A missing-scopes 403 on the upload → the missing-scopes message naming `write:media`.
+    * A 500 on the status call is retried once with the same `Idempotency-Key` and the same `media_ids`, with no second upload.
+    * Images with `quote` → "Mastodon doesn't allow images in a quote post", with no HTTP call. Images with `poll` → "images or a poll", with no HTTP call.
+    * Image-only post: blank `content` → `status: ""`. Image-only reply → `status: "@alice@example.social"`, and `media_ids` and `in_reply_to_id` are set.
+  * Bluesky:
+    * 2 images → two `uploadBlob` calls with raw bodies and the sniffed `Content-Type`, then one `createRecord` whose `embed` is `app.bsky.embed.images` with both blobs (exactly as returned), the alt texts and `aspectRatio`s, in order.
+    * Images with `quote` → `embed.$type` = `app.bsky.embed.recordWithMedia`, with `record.record` = the quoted `{uri, cid}` and `media` = the images embed. `embeddingDisabled` still rejects it before any upload.
+    * A reply with images has both `reply` and the images `embed`.
+    * An `ExpiredToken` on `uploadBlob` → `refreshSession`, and that upload is retried once.
+    * The body of `uploadBlob` for a JPEG with GPS EXIF contains no GPS data.
+  * Blank `content` with no `images` → the blank-content message, as before. `posting-enabled=false` with `images` → "Posting is disabled", and no file is read.
+* **`media` mapping (reads):**
+  * Mastodon: a status with an `image` and a `gifv` attachment → two `media` items with `type`, `url`, `previewUrl` and `altText`. A `null` description → `altText: null`. A remote attachment with `url: null` uses `remote_url`. A status without attachments → `media: []`. A boost maps the original's attachments.
+  * Bluesky: `images#view` → items with `url` = `fullsize` and `previewUrl` = `thumb`. `recordWithMedia#view` → both `quote` and `media` are filled. `gallery#view` → one item per `#viewImage`. `video#view` → one `video` item with `url` = `playlist`. A plain `record#view` or `external#view` → `media: []`.
 * **Platform-aware tool definitions:**
   * With only Mastodon configured, every tool with a `platform` parameter has `enum: ["mastodon"]`, a parameter description naming only `"mastodon"`, and `Mastodon` in place of `{platforms}`. Only-Bluesky mirrors this.
   * With both configured, the enum is `["mastodon", "bluesky"]` and the description says `Mastodon or Bluesky`.

@@ -66,6 +66,26 @@ class PlatformAwareToolDefinitionsContextTest {
 		}
 
 		@Test
+		@SuppressWarnings("unchecked")
+		void imageGuidanceReachesTheModel() {
+			Map<String, Tool> byName = new java.util.HashMap<>();
+			toolSpecs(context).forEach(spec -> byName.put(spec.tool().name(), spec.tool()));
+			for (String name : List.of("createSocialPost", "replyToSocialPost")) {
+				Tool tool = byName.get(name);
+				assertThat(tool.description()).as(name).contains("check them with checkSocialPost first");
+				Map<String, Object> images = (Map<String, Object>) ((Map<String, Object>) tool.inputSchema()
+					.get("properties")).get("images");
+				assertThat(images.get("description").toString()).as(name)
+					.contains("call checkSocialPost with these images")
+					.contains("Images attached to the chat can't be posted")
+					.contains("suggest Claude Code");
+				assertThat(tool.inputSchema().get("required").toString()).as(name).doesNotContain("images");
+			}
+			assertThat(byName.get("getSocialPostingRules").description()).contains("the image limits are for planning");
+			assertThat(byName.get("checkSocialPost").description()).contains("check image files");
+		}
+
+		@Test
 		void blueskyIsStillRejectedAtRuntime() {
 			assertThatThrownBy(() -> tools.getSocialTrends("bluesky", null))
 				.hasMessage("Platform bluesky is not configured");

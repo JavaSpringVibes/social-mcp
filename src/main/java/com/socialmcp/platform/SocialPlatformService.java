@@ -13,6 +13,7 @@ import com.socialmcp.model.PostActionResult;
 import com.socialmcp.model.PostInteractions;
 import com.socialmcp.model.PostResult;
 import com.socialmcp.model.PostingRules;
+import com.socialmcp.model.PreparedImage;
 import com.socialmcp.model.ProfileResult;
 import com.socialmcp.model.PublishedPost;
 import com.socialmcp.model.QuoteTarget;
@@ -90,17 +91,25 @@ public interface SocialPlatformService {
 	/** Reads the post being replied to and returns what the reply needs (SPEC §5, Reply). */
 	ReplyTarget replyTarget(String postRef);
 
-	/** Publishes {@code text}, already prefixed and measured, as a reply to {@code target}. */
-	PublishedPost reply(ReplyTarget target, String text);
+	/**
+	 * Publishes {@code text}, already prefixed and measured, as a reply to {@code target}, with zero to four images that
+	 * already passed SPEC §6.14.
+	 */
+	PublishedPost reply(ReplyTarget target, String text, List<PreparedImage> images);
 
 	/** Reads the post to quote and checks that the configured account may quote it (SPEC §5, Quote). */
 	QuoteTarget quoteTarget(String postRef);
 
 	/**
-	 * Publishes a top-level post with at most one of a quote or a poll (SPEC §4, Tool 8). The poll has already passed
-	 * SPEC §6.12.
+	 * Publishes a top-level post with at most one of a quote or a poll, and zero to four images (SPEC §4, Tool 8). The
+	 * poll has already passed SPEC §6.12, and the images SPEC §6.14 including the combination rules; the service only
+	 * uploads and attaches them (SPEC §5, Images).
 	 */
-	NewPost createTopLevelPost(String content, @Nullable QuoteTarget quote, @Nullable PollInput poll);
+	NewPost createTopLevelPost(String content, @Nullable QuoteTarget quote, @Nullable PollInput poll,
+			List<PreparedImage> images);
+
+	/** Whether images must have EXIF/XMP metadata stripped before upload (SPEC §6.14, step 9). */
+	boolean stripsImageMetadata();
 
 	/**
 	 * Votes in the poll on a post (SPEC §4, Tool 16).

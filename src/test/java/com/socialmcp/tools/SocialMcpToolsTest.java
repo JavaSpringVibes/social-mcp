@@ -1,12 +1,24 @@
 package com.socialmcp.tools;
 
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.List;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import com.socialmcp.config.SocialProperties;
 import com.socialmcp.config.TestProperties;
+import com.socialmcp.media.ImageFormats;
+import com.socialmcp.media.ImageLoader;
+import com.socialmcp.media.TestImages;
+import com.socialmcp.model.Dimensions;
+import com.socialmcp.model.ImageCheck;
+import com.socialmcp.model.ImageInput;
+import com.socialmcp.model.ImageRules;
 import com.socialmcp.model.PartCheck;
 import com.socialmcp.model.PostCheckResult;
 import com.socialmcp.model.ThreadResult;
@@ -30,7 +42,7 @@ class SocialMcpToolsTest {
 	}
 
 	private SocialMcpTools tools(SocialProperties properties) {
-		return new SocialMcpTools(List.of(mastodon, bluesky), properties);
+		return new SocialMcpTools(List.of(mastodon, bluesky), properties, new ImageLoader(properties));
 	}
 
 	private static SocialProperties properties(boolean postingEnabled, int maxParts) {
@@ -109,7 +121,7 @@ class SocialMcpToolsTest {
 
 	@Test
 	void checkNumbersPartsAndMeasuresWithSuffix() {
-		PostCheckResult result = tools.checkSocialPost("mastodon", List.of(" one ", "two", "three"), null);
+		PostCheckResult result = tools.checkSocialPost("mastodon", List.of(" one ", "two", "three"), null, null);
 		assertThat(result.valid()).isTrue();
 		assertThat(result.parts()).extracting(PartCheck::text)
 			.containsExactly("one (1/3)", "two (2/3)", "three (3/3)");
@@ -118,15 +130,15 @@ class SocialMcpToolsTest {
 
 	@Test
 	void checkWithoutNumberingAndSinglePartHasNoSuffix() {
-		assertThat(tools.checkSocialPost("mastodon", List.of("a", "b"), false).parts()).extracting(PartCheck::text)
+		assertThat(tools.checkSocialPost("mastodon", List.of("a", "b"), false, null).parts()).extracting(PartCheck::text)
 			.containsExactly("a", "b");
-		assertThat(tools.checkSocialPost("mastodon", List.of("solo"), true).parts().get(0).text()).isEqualTo("solo");
+		assertThat(tools.checkSocialPost("mastodon", List.of("solo"), true, null).parts().get(0).text()).isEqualTo("solo");
 	}
 
 	@Test
 	void partThatFitsOnlyWithoutSuffixIsOverWhenNumbered() {
 		String text = "x".repeat(15); // fits in 20 alone, but with " (1/2)" it is 21
-		PostCheckResult result = tools.checkSocialPost("mastodon", List.of(text, "ok"), true);
+		PostCheckResult result = tools.checkSocialPost("mastodon", List.of(text, "ok"), true, null);
 		assertThat(result.valid()).isFalse();
 		assertThat(result.problems()).containsExactly("Part 1 is 21/20 graphemes (1 over)");
 	}
@@ -134,7 +146,7 @@ class SocialMcpToolsTest {
 	@Test
 	void checkReportsBlankOverlongAndTooManyPartsWithoutThrowing() {
 		tools = tools(properties(true, 2));
-		PostCheckResult result = tools.checkSocialPost("mastodon", List.of("ok", "  ", "y".repeat(30)), false);
+		PostCheckResult result = tools.checkSocialPost("mastodon", List.of("ok", "  ", "y".repeat(30)), false, null);
 		assertThat(result.valid()).isFalse();
 		assertThat(result.problems()).containsExactly("Part 2 is blank", "Part 3 is 30/20 graphemes (10 over)",
 				"3 parts, but the maximum is 2");
@@ -143,16 +155,16 @@ class SocialMcpToolsTest {
 
 	@Test
 	void checkRequiresParts() {
-		assertThatThrownBy(() -> tools.checkSocialPost("mastodon", List.of(), null))
+		assertThatThrownBy(() -> tools.checkSocialPost("mastodon", List.of(), null, null))
 			.hasMessage("parts must contain at least one item");
-		assertThatThrownBy(() -> tools.checkSocialPost("mastodon", null, null))
+		assertThatThrownBy(() -> tools.checkSocialPost("mastodon", null, null, null))
 			.hasMessage("parts must contain at least one item");
 	}
 
 	@Test
 	void checkAndRulesWorkWhenPostingIsDisabled() {
 		tools = tools(properties(false, 10));
-		assertThat(tools.checkSocialPost("mastodon", List.of("hi"), null).valid()).isTrue();
+		assertThat(tools.checkSocialPost("mastodon", List.of("hi"), null, null).valid()).isTrue();
 		assertThat(tools.getSocialPostingRules("mastodon").maxLength()).isEqualTo(20);
 		tools.getSocialTimeline("mastodon", "home", null);
 		assertThat(mastodon.calls).containsExactly("timeline:HOME:10");
@@ -162,13 +174,13 @@ class SocialMcpToolsTest {
 
 	@Test
 	void createPostPublishesTrimmedText() {
-		assertThat(tools.createSocialPost("bluesky", "  hello ", null, null)).isEqualTo("Posted to bluesky: https://example/1");
+		assertThat(tools.createSocialPost("bluesky", "  hello ", null, null, null)).isEqualTo("Posted to bluesky: https://example/1");
 		assertThat(bluesky.posted.get(0)).containsExactly("hello", null, null);
 	}
 
 	@Test
 	void createPostTooLongSuggestsThread() {
-		assertThatThrownBy(() -> tools.createSocialPost("bluesky", "z".repeat(25), null, null)).hasMessage(
+		assertThatThrownBy(() -> tools.createSocialPost("bluesky", "z".repeat(25), null, null, null)).hasMessage(
 				"Content is 25/20 graphemes (5 over) on bluesky. Split it into parts and use createSocialThread.");
 		assertThat(bluesky.posted).isEmpty();
 	}
@@ -176,7 +188,7 @@ class SocialMcpToolsTest {
 	@Test
 	void postingDisabledBlocksBothPostingTools() {
 		tools = tools(properties(false, 10));
-		assertThatThrownBy(() -> tools.createSocialPost("mastodon", "hi", null, null)).isInstanceOf(IllegalStateException.class)
+		assertThatThrownBy(() -> tools.createSocialPost("mastodon", "hi", null, null, null)).isInstanceOf(IllegalStateException.class)
 			.hasMessage("Posting is disabled");
 		assertThatThrownBy(() -> tools.createSocialThread("mastodon", List.of("a", "b"), null))
 			.hasMessage("Posting is disabled");
@@ -256,7 +268,7 @@ class SocialMcpToolsTest {
 			.hasMessage("Muting is disabled");
 		assertThatThrownBy(() -> tools.setPostAction("mastodon", "1", "unbookmark"))
 			.hasMessage("Unbookmarking is disabled");
-		assertThatThrownBy(() -> tools.replyToSocialPost("mastodon", "1", "hi")).hasMessage("Posting is disabled");
+		assertThatThrownBy(() -> tools.replyToSocialPost("mastodon", "1", "hi", null)).hasMessage("Posting is disabled");
 		assertThatThrownBy(() -> tools.voteInSocialPoll("mastodon", "1", List.of(1))).hasMessage("Voting is disabled");
 		assertThat(tools.getSocialBookmarks("mastodon", null)).isEmpty();
 		assertThat(mastodon.calls).containsExactly("bookmarks:10");
@@ -274,14 +286,14 @@ class SocialMcpToolsTest {
 	@Test
 	void replyAddsTheAuthorMention() {
 		mastodon.replyMention = "al";
-		ReplyResultAssert.of(tools.replyToSocialPost("mastodon", "7", "  thanks ")).hasText("@al thanks");
+		ReplyResultAssert.of(tools.replyToSocialPost("mastodon", "7", "  thanks ", null)).hasText("@al thanks");
 		assertThat(mastodon.calls).containsExactly("replyTarget:7", "reply:7:@al thanks");
 	}
 
 	@Test
 	void replyKeepsAnExistingMentionInAnyCase() {
 		mastodon.replyMention = "al";
-		tools.replyToSocialPost("mastodon", "7", "hey @AL, thanks");
+		tools.replyToSocialPost("mastodon", "7", "hey @AL, thanks", null);
 		assertThat(mastodon.calls).contains("reply:7:hey @AL, thanks");
 		// The fully qualified handle of the author also counts as a mention.
 		assertThat(SocialMcpTools.mentions("thanks @Alice@Example.social!", "al", "@alice@example.social")).isTrue();
@@ -298,14 +310,14 @@ class SocialMcpToolsTest {
 	@Test
 	void replyWithoutMentionOrWithOwnPost() {
 		mastodon.replyMention = null;
-		assertThat(tools.replyToSocialPost("mastodon", "7", "more").text()).isEqualTo("more");
+		assertThat(tools.replyToSocialPost("mastodon", "7", "more", null).text()).isEqualTo("more");
 	}
 
 	@Test
 	void replyThatFitsOnlyWithoutThePrefixIsRejected() {
 		mastodon.replyMention = "alice";
 		String content = "z".repeat(15); // 15 fits the fake's 20, "@alice " + 15 = 22 doesn't
-		assertThatThrownBy(() -> tools.replyToSocialPost("mastodon", "7", content)).hasMessage(
+		assertThatThrownBy(() -> tools.replyToSocialPost("mastodon", "7", content, null)).hasMessage(
 				"Reply is 22/20 graphemes (2 over) on mastodon. Shorten it; replies are single posts. "
 						+ "The automatic mention '@alice ' counts toward the limit.");
 		assertThat(mastodon.calls).containsExactly("replyTarget:7");
@@ -313,7 +325,7 @@ class SocialMcpToolsTest {
 
 	@Test
 	void blankReplyMakesNoCall() {
-		assertThatThrownBy(() -> tools.replyToSocialPost("mastodon", "7", "  ")).hasMessage("content must not be blank");
+		assertThatThrownBy(() -> tools.replyToSocialPost("mastodon", "7", "  ", null)).hasMessage("content must not be blank");
 		assertThat(mastodon.calls).isEmpty();
 	}
 
@@ -322,21 +334,21 @@ class SocialMcpToolsTest {
 	@Test
 	void quoteIsResolvedThenPostedWithItsCaveat() {
 		mastodon.quoteCaveat = "the quote is waiting for @alice@example.social to approve it";
-		assertThat(tools.createSocialPost("mastodon", "my take", "7", null)).isEqualTo(
+		assertThat(tools.createSocialPost("mastodon", "my take", "7", null, null)).isEqualTo(
 				"Posted to mastodon: https://example/1 (the quote is waiting for @alice@example.social to approve it)");
 		assertThat(mastodon.calls).containsExactly("quoteTarget:7", "topLevel:my take:7:null");
 	}
 
 	@Test
 	void quoteAndPollTogetherAreRejected() {
-		assertThatThrownBy(() -> tools.createSocialPost("mastodon", "q", "7", poll("a", "b")))
+		assertThatThrownBy(() -> tools.createSocialPost("mastodon", "q", "7", poll("a", "b"), null))
 			.hasMessage("A post can have a quote or a poll, not both");
 		assertThat(mastodon.calls).isEmpty();
 	}
 
 	@Test
 	void validPollIsPosted() {
-		tools.createSocialPost("mastodon", "Java or Kotlin?", null, poll("Java", "Kotlin"));
+		tools.createSocialPost("mastodon", "Java or Kotlin?", null, poll("Java", "Kotlin"), null);
 		assertThat(mastodon.calls).containsExactly("topLevel:Java or Kotlin?:null:[Java, Kotlin]");
 	}
 
@@ -353,14 +365,14 @@ class SocialMcpToolsTest {
 				"A poll must last between 5 minutes and 43829 minutes on mastodon");
 		assertThat(mastodon.posted).isEmpty();
 		// case differs, so these are different options
-		tools.createSocialPost("mastodon", "q", null, poll("Java", "java"));
+		tools.createSocialPost("mastodon", "q", null, poll("Java", "java"), null);
 		assertThat(mastodon.posted).hasSize(1);
 	}
 
 	@Test
 	void blueskyPollIsRejectedWithoutACall() {
 		bluesky.polls = false;
-		assertThatThrownBy(() -> tools.createSocialPost("bluesky", "q", null, poll("a", "b")))
+		assertThatThrownBy(() -> tools.createSocialPost("bluesky", "q", null, poll("a", "b"), null))
 			.hasMessage("Bluesky doesn't support polls");
 		assertThatThrownBy(() -> tools.voteInSocialPoll("bluesky", "at://x", List.of(1)))
 			.hasMessage("Bluesky doesn't support polls");
@@ -382,12 +394,139 @@ class SocialMcpToolsTest {
 		assertThat(mastodon.calls).containsExactly("vote:7:[1, 3]");
 	}
 
+	// --- Images (SPEC §6.14) ---
+
+	@TempDir
+	Path dir;
+
+	private ImageInput png(String name) throws IOException {
+		return new ImageInput(Files.write(dir.resolve(name), TestImages.png(4, 3)).toString(), "A small picture");
+	}
+
+	@Test
+	void anImageOnlyPostIsAllowed() throws IOException {
+		assertThat(tools.createSocialPost("bluesky", null, null, null, List.of(png("a.png"))))
+			.isEqualTo("Posted to bluesky: https://example/1");
+		assertThat(bluesky.posted.get(0)[0]).isEmpty();
+		assertThat(bluesky.attached).singleElement().satisfies(image -> {
+			assertThat(image.mimeType()).isEqualTo("image/png");
+			assertThat(image.altText()).isEqualTo("A small picture");
+			assertThat(image.width()).isEqualTo(4);
+		});
+	}
+
+	@Test
+	void blankContentStillNeedsImages() {
+		assertThatThrownBy(() -> tools.createSocialPost("bluesky", "  ", null, null, List.of()))
+			.hasMessage("content must not be blank");
+	}
+
+	@Test
+	void imagesCantGoWithAPollOrAMastodonQuote() throws IOException {
+		ImageInput image = png("a.png");
+		assertThatThrownBy(() -> tools.createSocialPost("mastodon", "q", null, poll("a", "b"), List.of(image)))
+			.hasMessage("A post can have images or a poll, not both");
+		mastodon.imageRules = new ImageRules(4, 1000, 10_000L, 50, ImageFormats.SNIFFABLE, false, false, null, "instance");
+		assertThatThrownBy(() -> tools.createSocialPost("mastodon", "q", "7", null, List.of(image)))
+			.hasMessage("Mastodon doesn't allow images in a quote post");
+		assertThat(mastodon.calls).isEmpty();
+	}
+
+	@Test
+	void imagesAndAQuoteWorkWhereThePlatformAllowsIt() throws IOException {
+		tools.createSocialPost("bluesky", "look", "7", null, List.of(png("a.png")));
+		assertThat(bluesky.calls).contains("quoteTarget:7");
+		assertThat(bluesky.attached).hasSize(1);
+	}
+
+	@Test
+	void tooManyOrBadImagesPostNothing() throws IOException {
+		ImageInput image = png("a.png");
+		assertThatThrownBy(() -> tools.createSocialPost("bluesky", "x", null, null, List.of(image, image, image, image, image)))
+			.hasMessage("At most 4 images per post on bluesky");
+		ImageInput noAlt = new ImageInput(image.source(), "");
+		assertThatThrownBy(() -> tools.createSocialPost("bluesky", "x", null, null, List.of(image, noAlt)))
+			.hasMessage("Image 2 needs alt text describing what it shows");
+		assertThat(bluesky.posted).isEmpty();
+	}
+
+	@Test
+	void postingDisabledReadsNoImage() {
+		tools = tools(properties(false, 10));
+		assertThatThrownBy(() -> tools.createSocialPost("bluesky", null, null, null,
+				List.of(new ImageInput(dir.resolve("missing.png").toString(), "alt"))))
+			.hasMessage("Posting is disabled");
+	}
+
+	@Test
+	void anImageOnlyReplyStillMentionsTheAuthorOnMastodon() throws IOException {
+		mastodon.replyMention = "al"; // the fake allows only 20 graphemes
+		assertThat(tools.replyToSocialPost("mastodon", "7", null, List.of(png("a.png"))).text()).isEqualTo("@al");
+		assertThat(mastodon.calls).contains("reply:7:@al");
+		assertThat(mastodon.attached).hasSize(1);
+	}
+
+	@Test
+	void checkSocialPostChecksImagesWithoutParts() throws IOException {
+		Path big = Files.write(dir.resolve("big.jpg"), TestImages.fakeJpeg(200, 100, 5000));
+		Path text = Files.write(dir.resolve("beach.heic"), "not an image".getBytes(StandardCharsets.UTF_8));
+		PostCheckResult result = tools.checkSocialPost("bluesky", null, null,
+				List.of(new ImageInput(big.toString(), "big"), new ImageInput(text.toString(), null), png("ok.png")));
+		assertThat(result.valid()).isFalse();
+		assertThat(result.parts()).isEmpty();
+		assertThat(result.images()).extracting(ImageCheck::ok).containsExactly(false, false, true);
+		// The fake platform allows 1000 bytes and 10000 pixels.
+		assertThat(result.images().get(0).problems()).containsExactly(
+				"is 200×100 (20000 pixels); the maximum on bluesky is 10000 pixels",
+				"is 5000 bytes; the maximum on bluesky is 1000 bytes. Resize or recompress it and try again.");
+		assertThat(result.images().get(0).fitWithin()).isEqualTo(new Dimensions(84, 42));
+		assertThat(result.images().get(1).mimeType()).isNull();
+		assertThat(result.problems()).containsExactly(
+				"Image 1 is 200×100 (20000 pixels); the maximum on bluesky is 10000 pixels",
+				"Image 1 is 5000 bytes; the maximum on bluesky is 1000 bytes. Resize or recompress it and try again",
+				"Image 2 needs alt text describing what it shows",
+				"Image 2 is not a JPEG, PNG, GIF or WebP image. Convert it to JPEG");
+	}
+
+	@Test
+	void checkSocialPostCountsImagesAndStillChecksEach() throws IOException {
+		ImageInput image = png("a.png");
+		PostCheckResult result = tools.checkSocialPost("bluesky", List.of("hi"), null,
+				List.of(image, image, image, image, image));
+		assertThat(result.problems()).containsExactly("5 images, but the maximum on bluesky is 4");
+		assertThat(result.images()).hasSize(5).allSatisfy(check -> assertThat(check.ok()).isTrue());
+		assertThat(result.parts()).hasSize(1);
+	}
+
+	@Test
+	void anEmptyPartsListIsStillRejectedWithImages() throws IOException {
+		ImageInput image = png("a.png");
+		assertThatThrownBy(() -> tools.checkSocialPost("bluesky", List.of(), null, List.of(image)))
+			.hasMessage("parts must contain at least one item");
+	}
+
+	@Test
+	void postingFailsOnTheSameFirstProblemTheCheckListsFirst() throws IOException {
+		Path big = Files.write(dir.resolve("big.jpg"), TestImages.fakeJpeg(200, 100, 5000));
+		List<ImageInput> images = List.of(png("ok.png"), new ImageInput(big.toString(), "big"));
+		String first = tools.checkSocialPost("bluesky", null, null, images).problems().get(0);
+		assertThatThrownBy(() -> tools.createSocialPost("bluesky", "x", null, null, images)).hasMessage(first);
+	}
+
+	@Test
+	void blueskyStyleStrippingIsAppliedWhenThePlatformAsks() throws IOException {
+		bluesky.stripImages = true;
+		Path photo = Files.write(dir.resolve("gps.jpg"), TestImages.withMetadata(TestImages.jpeg(8, 8), 1));
+		tools.createSocialPost("bluesky", "x", null, null, List.of(new ImageInput(photo.toString(), "alt")));
+		assertThat(TestImages.contains(bluesky.attached.get(0).bytes(), TestImages.SECRET)).isFalse();
+	}
+
 	private static com.socialmcp.model.PollInput poll(String... options) {
 		return new com.socialmcp.model.PollInput(List.of(options), null, null, null);
 	}
 
 	private void assertPollRejected(com.socialmcp.model.PollInput poll, String message) {
-		assertThatThrownBy(() -> tools.createSocialPost("mastodon", "q", null, poll))
+		assertThatThrownBy(() -> tools.createSocialPost("mastodon", "q", null, poll, null))
 			.isInstanceOf(IllegalArgumentException.class)
 			.hasMessage(message);
 	}

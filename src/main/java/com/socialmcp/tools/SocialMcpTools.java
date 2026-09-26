@@ -16,7 +16,11 @@ import org.springframework.ai.mcp.annotation.McpToolParam;
 import org.springframework.stereotype.Component;
 
 import com.socialmcp.config.SocialProperties;
+import com.socialmcp.media.ImageLoader;
 import com.socialmcp.model.AccountAction;
+import com.socialmcp.model.ImageCheck;
+import com.socialmcp.model.ImageInput;
+import com.socialmcp.model.ImageRules;
 import com.socialmcp.model.NewPost;
 import com.socialmcp.model.PartCheck;
 import com.socialmcp.model.PollInput;
@@ -27,6 +31,7 @@ import com.socialmcp.model.PostCheckResult;
 import com.socialmcp.model.PostInteractions;
 import com.socialmcp.model.PostResult;
 import com.socialmcp.model.PostingRules;
+import com.socialmcp.model.PreparedImage;
 import com.socialmcp.model.ProfileResult;
 import com.socialmcp.model.PublishedPost;
 import com.socialmcp.model.QuoteTarget;
@@ -65,13 +70,29 @@ public class SocialMcpTools {
 			Optional poll (Mastodon only): {options: 2+ answers, expiresInMinutes (default 1440), multiple (default \
 			false), hideTotals (default false)}. Limits are in getSocialPostingRules.polls.""";
 
+	private static final String IMAGES_DESC = """
+			Optional images, up to 4 (see getSocialPostingRules.images). Each item: {source: an absolute file path on \
+			the user's computer or an https URL, altText: what the image shows, for people who can't see it}. Size and \
+			format limits differ by platform and server, and the server never resizes. Before attaching, call \
+			checkSocialPost with these images; resize or convert any it reports, check again, then post. Images \
+			attached to the chat can't be posted: ask the user for the file's path on their computer. If you can't \
+			resize an image, tell the user the fitWithin size, or suggest Claude Code.""";
+
+	private static final String IMAGE_RULES = """
+			Images: check them with checkSocialPost first and resize or convert any it reports with your own tools \
+			(the server never resizes), write alt text that describes what each image shows (never invented), and \
+			attach only images the user asked to post, because their contents are published.""";
+
 	private final List<SocialPlatformService> platforms;
 
 	private final SocialProperties properties;
 
-	public SocialMcpTools(List<SocialPlatformService> platforms, SocialProperties properties) {
+	private final ImageLoader imageLoader;
+
+	public SocialMcpTools(List<SocialPlatformService> platforms, SocialProperties properties, ImageLoader imageLoader) {
 		this.platforms = platforms;
 		this.properties = properties;
+		this.imageLoader = imageLoader;
 	}
 
 	@McpTool(name = "searchSocialPosts", description = """
@@ -181,60 +202,113 @@ public class SocialMcpTools {
 	@McpTool(name = "createSocialPost", description = """
 			Publish a single public text post on {platforms} as the configured account. Plain text only; \
 			markdown is not rendered. For content longer than the platform limit, use createSocialThread. Optionally \
-			quote another post (quote = its id or URL), or attach a poll (Mastodon only; check the poll limits in \
-			getSocialPostingRules first). A post can have a quote or a poll, not both. Returns a confirmation with the \
-			post URL, plus any caveat in parentheses (e.g. a quote waiting for the author's approval).""")
+			quote another post (quote = its id or URL), attach up to 4 images, or attach a poll (Mastodon only; check \
+			the poll limits in getSocialPostingRules first). A post can have a quote or a poll, not both; images can't \
+			go with a poll, and on Mastodon not with a quote either. With images, content may be empty.""" + " "
+			+ IMAGE_RULES + " " + """
+					Returns a confirmation with the post URL, plus any caveat in parentheses (e.g. a quote waiting for \
+					the author's approval).""")
 	public String createSocialPost(
 			@McpToolParam(description = PLATFORM_DESC) String platform,
-			@McpToolParam(description = "Plain-text post content.") String content,
+			@McpToolParam(description = "Plain-text post content. May be empty when images are attached.",
+					required = false) @Nullable String content,
 			@McpToolParam(description = "Optional post to quote: " + POST_DESC, required = false) @Nullable String quote,
-			@McpToolParam(description = POLL_DESC, required = false) @Nullable PollInput poll) {
+			@McpToolParam(description = POLL_DESC, required = false) @Nullable PollInput poll,
+			@McpToolParam(description = IMAGES_DESC, required = false) @Nullable List<ImageInput> images) {
 		requirePostingEnabled();
 		SocialPlatformService service = platform(platform);
-		if (content == null || content.isBlank()) {
+		List<ImageInput> imageList = images == null ? List.of() : images;
+		boolean hasImages = !imageList.isEmpty();
+		String text = content == null ? "" : content.trim();
+		if (text.isEmpty() && !hasImages) {
 			throw new IllegalArgumentException("content must not be blank");
 		}
-		String text = content.trim();
-		PartCheck check = call(service, () -> service.checkPart(1, text));
-		if (!check.ok()) {
-			throw new IllegalArgumentException("Content is " + check.reason() + " on " + service.platform()
-					+ ". Split it into parts and use createSocialThread.");
+		if (!text.isEmpty()) {
+			PartCheck check = call(service, () -> service.checkPart(1, text));
+			if (!check.ok()) {
+				throw new IllegalArgumentException("Content is " + check.reason() + " on " + service.platform()
+						+ ". Split it into parts and use createSocialThread.");
+			}
 		}
 		String quoteRef = quote == null || quote.isBlank() ? null : quote;
 		if (quoteRef != null && poll != null) {
 			throw new IllegalArgumentException("A post can have a quote or a poll, not both");
 		}
+		List<PreparedImage> prepared = List.of();
+		if (hasImages) {
+			ImageRules rules = call(service, service::postingRules).images();
+			if (poll != null) {
+				throw new IllegalArgumentException("A post can have images or a poll, not both");
+			}
+			if (quoteRef != null && !rules.withQuote()) {
+				throw new IllegalArgumentException(capitalize(service.platform()) + " doesn't allow images in a quote post");
+			}
+			prepared = prepareImages(service, imageList, rules);
+		}
 		if (poll != null) {
 			checkPoll(service, poll);
 		}
 		QuoteTarget target = quoteRef == null ? null : call(service, () -> service.quoteTarget(quoteRef));
-		NewPost post = call(service, () -> service.createTopLevelPost(text, target, poll));
+		List<PreparedImage> attached = prepared;
+		NewPost post = call(service, () -> service.createTopLevelPost(text, target, poll, attached));
 		return "Posted to " + service.platform() + ": " + post.post().url()
 				+ (post.caveat() == null ? "" : " (" + post.caveat() + ")");
 	}
 
 	@McpTool(name = "getSocialPostingRules", description = """
 			Get the posting limits on {platforms} and how length is counted, to plan splitting long content into thread \
-			parts. Do not count characters yourself: measure drafts with checkSocialPost. Returns {platform, \
-			maxLength, unit, urlLength, maxBytes, maxThreadParts, numberingFormat, numberingReserve, \
-			followUpVisibility, countingNotes, source}.""")
+			parts. Do not count characters yourself: measure drafts with checkSocialPost. Also reports quote support, \
+			poll limits and image limits; the image limits are for planning, and checkSocialPost checks actual image \
+			files against them. Returns {platform, maxLength, unit, urlLength, maxBytes, maxThreadParts, \
+			numberingFormat, numberingReserve, followUpVisibility, countingNotes, source, quotes, polls, images: \
+			{maxImages, maxBytes, maxPixels, maxAltTextLength, mimeTypes, withQuote, withPoll, \
+			recommendedMaxDimension, source}}.""")
 	public PostingRules getSocialPostingRules(@McpToolParam(description = PLATFORM_DESC) String platform) {
 		SocialPlatformService service = platform(platform);
 		return call(service, service::postingRules);
 	}
 
 	@McpTool(name = "checkSocialPost", description = """
-			Measure draft posts for {platforms} against the platform's limits without posting anything. Pass the parts of a planned \
-			thread in order (or one item for a single post). With numbered=true (default) each part is measured with \
-			the " (n/N)" suffix createSocialThread adds. Returns {platform, valid, maxLength, unit, problems, parts: \
-			[{index, text, length, bytes, ok, reason}]}; rewrite only the parts that are not ok.""")
+			Measure draft posts for {platforms} against the platform's limits, and check image files against its \
+			image limits, without posting or uploading anything. Pass the parts of a planned thread in order (or one \
+			item for a single post). With numbered=true (default) each part is measured with the " (n/N)" suffix \
+			createSocialThread adds. Before attaching images to createSocialPost or replyToSocialPost, check them \
+			here: each image gets its size, dimensions, problems and fitWithin (the size to resize to); resize or \
+			convert any that are not ok, and check again. Returns {platform, valid, maxLength, unit, problems, parts: \
+			[{index, text, length, bytes, ok, reason}], images: [{index, source, ok, mimeType, bytes, width, height, \
+			problems, fitWithin}]}; fix only what is not ok.""")
 	public PostCheckResult checkSocialPost(
 			@McpToolParam(description = PLATFORM_DESC) String platform,
-			@McpToolParam(description = "Draft texts, in order.") List<String> parts,
+			@McpToolParam(description = "Draft texts, in order. May be omitted when only checking images.",
+					required = false) @Nullable List<String> parts,
 			@McpToolParam(description = "Add \" (n/N)\" numbering to each part. Default true; ignored for one part.",
-					required = false) @Nullable Boolean numbered) {
+					required = false) @Nullable Boolean numbered,
+			@McpToolParam(description = """
+					Optional images one post would carry, in order: [{source: absolute file path or https URL, \
+					altText}]. altText may be left out here; it is then reported as a problem.""",
+					required = false) @Nullable List<ImageInput> images) {
 		SocialPlatformService service = platform(platform);
-		return call(service, () -> check(service, parts, numbered));
+		List<ImageInput> imageList = images == null ? List.of() : images;
+		boolean hasImages = !imageList.isEmpty();
+		PostCheckResult text = call(service,
+				() -> check(service, parts, numbered, hasImages));
+		if (!hasImages) {
+			return text;
+		}
+		ImageRules rules = call(service, service::postingRules).images();
+		List<String> problems = new ArrayList<>(text.problems());
+		if (imageList.size() > rules.maxImages()) {
+			problems.add(imageList.size() + " images, but the maximum on " + service.platform() + " is " + rules.maxImages());
+		}
+		List<ImageCheck> checks = new ArrayList<>();
+		for (int i = 0; i < imageList.size(); i++) {
+			ImageLoader.Inspection inspection = imageLoader.inspect(i + 1, imageList.get(i), rules, service.platform(),
+					service.stripsImageMetadata());
+			checks.add(inspection.check());
+			inspection.errors().forEach(e -> problems.add(e.endsWith(".") ? e.substring(0, e.length() - 1) : e));
+		}
+		return new PostCheckResult(text.platform(), problems.isEmpty(), text.maxLength(), text.unit(),
+				List.copyOf(problems), text.parts(), List.copyOf(checks));
 	}
 
 	@McpTool(name = "createSocialThread", description = """
@@ -325,33 +399,43 @@ public class SocialMcpTools {
 	}
 
 	@McpTool(name = "replyToSocialPost", description = """
-			Publish a plain-text reply to any post on {platforms} (other people's or your own) as the configured \
-			account. Only reply when the user asked to, and show them the exact text first unless they dictated it. \
-			On Mastodon the server adds "@author " in front so the author is notified; it counts toward the limit, \
-			so include it when measuring drafts with checkSocialPost. A reply is one post: for more, reply again to \
-			your own reply. Returns {platform, url, inReplyTo, text}.""")
+			Publish a plain-text reply, optionally with up to 4 images, to any post on {platforms} (other people's or \
+			your own) as the configured account. Only reply when the user asked to, and show them the exact text \
+			first unless they dictated it. On Mastodon the server adds "@author " in front so the author is notified; \
+			it counts toward the limit, so include it when measuring drafts with checkSocialPost. With images, content \
+			may be empty.""" + " " + IMAGE_RULES + " " + """
+					A reply is one post: for more, reply again to your own reply. Returns {platform, url, inReplyTo, \
+					text}.""")
 	public ReplyResult replyToSocialPost(
 			@McpToolParam(description = PLATFORM_DESC) String platform,
 			@McpToolParam(description = "The post to reply to: " + POST_DESC) String post,
-			@McpToolParam(description = "Plain-text reply content.") String content) {
+			@McpToolParam(description = "Plain-text reply content. May be empty when images are attached.",
+					required = false) @Nullable String content,
+			@McpToolParam(description = IMAGES_DESC, required = false) @Nullable List<ImageInput> images) {
 		requirePostingEnabled();
 		SocialPlatformService service = platform(platform);
 		String ref = requirePost(post);
-		if (content == null || content.isBlank()) {
+		List<ImageInput> imageList = images == null ? List.of() : images;
+		boolean hasImages = !imageList.isEmpty();
+		String trimmed = content == null ? "" : content.trim();
+		if (trimmed.isEmpty() && !hasImages) {
 			throw new IllegalArgumentException("content must not be blank");
 		}
-		String trimmed = content.trim();
 		ReplyTarget target = call(service, () -> service.replyTarget(ref));
 		String mention = target.mention();
 		boolean addPrefix = mention != null && !mentions(trimmed, mention, target.inReplyTo().author());
-		String text = addPrefix ? "@" + mention + " " + trimmed : trimmed;
-		PartCheck check = call(service, () -> service.checkPart(1, text));
-		if (!check.ok()) {
-			throw new IllegalArgumentException("Reply is " + check.reason() + " on " + service.platform()
-					+ ". Shorten it; replies are single posts."
-					+ (addPrefix ? " The automatic mention '@" + mention + " ' counts toward the limit." : ""));
+		String text = (addPrefix ? "@" + mention + " " + trimmed : trimmed).trim();
+		if (!text.isEmpty()) {
+			PartCheck check = call(service, () -> service.checkPart(1, text));
+			if (!check.ok()) {
+				throw new IllegalArgumentException("Reply is " + check.reason() + " on " + service.platform()
+						+ ". Shorten it; replies are single posts."
+						+ (addPrefix ? " The automatic mention '@" + mention + " ' counts toward the limit." : ""));
+			}
 		}
-		PublishedPost published = call(service, () -> service.reply(target, text));
+		List<PreparedImage> prepared = hasImages
+				? prepareImages(service, imageList, call(service, service::postingRules).images()) : List.of();
+		PublishedPost published = call(service, () -> service.reply(target, text, prepared));
 		return new ReplyResult(service.platform(), published.url(), target.inReplyTo(), text);
 	}
 
@@ -529,6 +613,17 @@ public class SocialMcpTools {
 	/** Applies trimming and numbering (SPEC §6.10), then measures every part. */
 	private PostCheckResult check(SocialPlatformService service, @Nullable List<String> parts,
 			@Nullable Boolean numbered) {
+		return check(service, parts, numbered, false);
+	}
+
+	/** @param allowMissing whether a null {@code parts} means "no text to check" ({@code checkSocialPost} with images) */
+	private PostCheckResult check(SocialPlatformService service, @Nullable List<String> parts,
+			@Nullable Boolean numbered, boolean allowMissing) {
+		if (parts == null && allowMissing) {
+			PostingRules rules = service.postingRules();
+			return new PostCheckResult(service.platform(), true, rules.maxLength(), rules.unit(), List.of(), List.of(),
+					List.of());
+		}
 		if (parts == null || parts.isEmpty()) {
 			throw new IllegalArgumentException("parts must contain at least one item");
 		}
@@ -553,7 +648,29 @@ public class SocialMcpTools {
 		}
 		PostingRules rules = service.postingRules();
 		return new PostCheckResult(service.platform(), problems.isEmpty(), rules.maxLength(), rules.unit(),
-				List.copyOf(problems), List.copyOf(checks));
+				List.copyOf(problems), List.copyOf(checks), List.of());
+	}
+
+	/**
+	 * Loads and checks every image of a post before anything is uploaded (SPEC §6.14), throwing the first problem. The
+	 * combination rules are the caller's.
+	 */
+	private List<PreparedImage> prepareImages(SocialPlatformService service, List<ImageInput> inputs, ImageRules rules) {
+		if (inputs.size() > rules.maxImages()) {
+			throw new IllegalArgumentException(
+					"At most " + rules.maxImages() + " images per post on " + service.platform());
+		}
+		List<PreparedImage> prepared = new ArrayList<>();
+		for (int i = 0; i < inputs.size(); i++) {
+			ImageLoader.Inspection inspection = imageLoader.inspect(i + 1, inputs.get(i), rules, service.platform(),
+					service.stripsImageMetadata());
+			PreparedImage image = inspection.image();
+			if (image == null) {
+				throw new IllegalArgumentException(String.valueOf(inspection.error()));
+			}
+			prepared.add(image);
+		}
+		return List.copyOf(prepared);
 	}
 
 	private static <T> T call(SocialPlatformService service, Supplier<T> action) {

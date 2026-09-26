@@ -1,6 +1,9 @@
 package com.socialmcp.platform.bluesky;
 
 import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -10,19 +13,27 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import org.jspecify.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.HttpClientErrorException;
+import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestClient;
+import org.springframework.web.client.RestClientException;
 import org.springframework.web.client.RestClientResponseException;
 
 import com.socialmcp.config.SocialProperties;
+import com.socialmcp.media.ImageFormats;
 import com.socialmcp.model.AccountAction;
 import com.socialmcp.model.AccountSummary;
+import com.socialmcp.model.ImageRules;
+import com.socialmcp.model.MediaSummary;
 import com.socialmcp.model.NewPost;
 import com.socialmcp.model.PartCheck;
 import com.socialmcp.model.PollInput;
@@ -31,6 +42,7 @@ import com.socialmcp.model.PostActionResult;
 import com.socialmcp.model.PostInteractions;
 import com.socialmcp.model.PostResult;
 import com.socialmcp.model.PostingRules;
+import com.socialmcp.model.PreparedImage;
 import com.socialmcp.model.ProfileResult;
 import com.socialmcp.model.PublishedPost;
 import com.socialmcp.model.QuoteSummary;
@@ -43,6 +55,7 @@ import com.socialmcp.model.TimelineType;
 import com.socialmcp.model.TrendTag;
 import com.socialmcp.model.TrendsResult;
 import com.socialmcp.model.VoteResult;
+import com.socialmcp.platform.ApiErrors;
 import com.socialmcp.platform.Json;
 import com.socialmcp.platform.SocialPlatformService;
 import com.socialmcp.text.TextLength;
@@ -50,6 +63,8 @@ import com.socialmcp.text.TextLength;
 /** Bluesky via AT Protocol XRPC through the account's PDS (SPEC §5, Bluesky). */
 @Service
 public class BlueskyService implements SocialPlatformService {
+
+	private static final Logger log = LoggerFactory.getLogger(BlueskyService.class);
 
 	static final String PLATFORM = "bluesky";
 
@@ -72,6 +87,19 @@ public class BlueskyService implements SocialPlatformService {
 	private static final String EMBED_RECORD_WITH_MEDIA_VIEW = "app.bsky.embed.recordWithMedia#view";
 
 	private static final String NO_POLLS = "Bluesky doesn't support polls";
+
+	private static final int MAX_IMAGES = 4;
+
+	/** The official app's alt text limit; the lexicon sets none. */
+	private static final int MAX_ALT_TEXT = 2000;
+
+	/** The official app downscales to fit 4000 × 4000; a suggestion, not a limit. */
+	private static final int RECOMMENDED_MAX_DIMENSION = 4000;
+
+	/** The image limit before the April 2026 lexicon change, still enforced by some self-hosted PDSes. */
+	private static final long OLD_IMAGE_LIMIT = 1_000_000;
+
+	private static final Duration SERVER_RETRY_BACKOFF = Duration.ofMinutes(10);
 
 	private static final String FOLLOW_COLLECTION = "app.bsky.graph.follow";
 
@@ -99,6 +127,13 @@ public class BlueskyService implements SocialPlatformService {
 
 	/** The cached login; null until the first authenticated call. */
 	private @Nullable Session session;
+
+	/** The PDS's {@code describeServer} upload limit and when it was fetched; null until first use. */
+	private @Nullable ServerLimits serverLimits;
+
+	/** {@code blobUploadLimit} (null when the PDS reports none); {@code ok} is false when the call failed. */
+	private record ServerLimits(@Nullable Long blobUploadLimit, boolean ok, Instant attemptedAt) {
+	}
 
 	record Session(String accessJwt, String refreshJwt, String did, String handle) {
 	}
@@ -132,6 +167,12 @@ public class BlueskyService implements SocialPlatformService {
 	@Override
 	public boolean supportsPolls() {
 		return false;
+	}
+
+	/** The PDS stores and serves uploads unchanged, so EXIF would be public (SPEC §5, Images). */
+	@Override
+	public boolean stripsImageMetadata() {
+		return true;
 	}
 
 	// --- Search, timelines, user posts ---
@@ -335,21 +376,145 @@ public class BlueskyService implements SocialPlatformService {
 
 	@Override
 	public PublishedPost createPost(String content, @Nullable PublishedPost root, @Nullable PublishedPost parent) {
-		Map<String, Object> record = new LinkedHashMap<>();
-		record.put("$type", "app.bsky.feed.post");
-		record.put("text", content);
-		record.put("createdAt", clock.instant().toString());
-		if (root != null && parent != null) {
-			record.put("reply", Map.of("root", Map.of("uri", root.id(), "cid", root.cid()), "parent",
-					Map.of("uri", parent.id(), "cid", parent.cid())));
-		}
-		return publishPost(record);
+		return publishPost(replyRecord(content, root, parent), List.of());
 	}
 
-	private PublishedPost publishPost(Map<String, Object> record) {
-		JsonNode created = createRecord("app.bsky.feed.post", record);
+	private Map<String, Object> replyRecord(String content, @Nullable PublishedPost root,
+			@Nullable PublishedPost parent) {
+		Map<String, Object> record = postRecord(content);
+		if (root != null && parent != null) {
+			record.put("reply", Map.of("root", Map.of("uri", root.id(), "cid", String.valueOf(root.cid())), "parent",
+					Map.of("uri", parent.id(), "cid", String.valueOf(parent.cid()))));
+		}
+		return record;
+	}
+
+	/**
+	 * Creates the post record. With images, a 400 while any image is over the old 1 MB limit gets a hint, since some
+	 * self-hosted PDSes still enforce it and no API reports that (SPEC §5, Images).
+	 */
+	private PublishedPost publishPost(Map<String, Object> record, List<PreparedImage> images) {
+		JsonNode created;
+		try {
+			created = createRecord("app.bsky.feed.post", record);
+		}
+		catch (HttpClientErrorException ex) {
+			if (ex.getStatusCode().value() == 400 && images.stream().anyMatch(i -> i.bytes().length > OLD_IMAGE_LIMIT)) {
+				throw new IllegalStateException(ApiErrors.message(PLATFORM, ex)
+						+ " Your PDS may still enforce the older 1 MB image limit; set BLUESKY_MAX_IMAGE_BYTES=1000000, "
+						+ "or resize the images below 1 MB.", ex);
+			}
+			throw ex;
+		}
 		String uri = Json.text(created, "uri");
 		return new PublishedPost(uri, Json.text(created, "cid"), postUrl(session().handle(), uri));
+	}
+
+	// --- Images (SPEC §5, Images) ---
+
+	/** Uploads each image in order and returns the {@code app.bsky.embed.images} embed that references them. */
+	private Map<String, Object> uploadImages(List<PreparedImage> images) {
+		List<Map<String, Object>> embedded = new ArrayList<>();
+		for (PreparedImage image : images) {
+			JsonNode blob;
+			try {
+				blob = withSession(s -> Json.required(http.post()
+					.uri("/com.atproto.repo.uploadBlob")
+					.header(HttpHeaders.AUTHORIZATION, "Bearer " + s.accessJwt())
+					.contentType(MediaType.parseMediaType(image.mimeType()))
+					.body(image.bytes())
+					.retrieve()
+					.body(JsonNode.class), PLATFORM)).get("blob");
+			}
+			catch (RestClientResponseException ex) {
+				String message = errorMessage(ex);
+				throw uploadFailure(image.index(), images.size(),
+						message.isEmpty() ? "HTTP " + ex.getStatusCode().value() : message);
+			}
+			catch (ResourceAccessException ex) {
+				throw uploadFailure(image.index(), images.size(),
+						"bluesky is unreachable: " + ex.getMostSpecificCause().getMessage());
+			}
+			if (!Json.isPresent(blob)) {
+				throw uploadFailure(image.index(), images.size(), "the PDS returned no blob");
+			}
+			Map<String, Object> item = new LinkedHashMap<>();
+			item.put("image", blob);
+			item.put("alt", image.altText());
+			item.put("aspectRatio", Map.of("width", image.width(), "height", image.height()));
+			embedded.add(item);
+		}
+		return Map.of("$type", "app.bsky.embed.images", "images", embedded);
+	}
+
+	private static IllegalStateException uploadFailure(int index, int total, String reason) {
+		String trimmed = reason.endsWith(".") ? reason.substring(0, reason.length() - 1) : reason;
+		return new IllegalStateException("Image " + index + " of " + total + " could not be uploaded to " + PLATFORM
+				+ ": " + trimmed + ". Nothing was posted.");
+	}
+
+	/** The media part of a post's embed view (SPEC §5, Bluesky post mapping). */
+	static List<MediaSummary> toMedia(@Nullable JsonNode embed) {
+		JsonNode media = EMBED_RECORD_WITH_MEDIA_VIEW.equals(Json.text(embed, "$type")) && embed != null
+				? embed.get("media") : embed;
+		return switch (Json.text(media, "$type")) {
+			case "app.bsky.embed.images#view" -> Json.array(media, "images")
+				.stream()
+				.map(i -> new MediaSummary("image", blankToNull(Json.text(i, "fullsize")),
+						blankToNull(Json.text(i, "thumb")), blankToNull(Json.text(i, "alt"))))
+				.toList();
+			case "app.bsky.embed.gallery#view" -> Json.array(media, "items")
+				.stream()
+				.filter(i -> Json.text(i, "$type").isEmpty() || Json.text(i, "$type").endsWith("#viewImage"))
+				.map(i -> new MediaSummary("image", blankToNull(Json.text(i, "fullsize")),
+						blankToNull(Json.text(i, "thumbnail")), blankToNull(Json.text(i, "alt"))))
+				.toList();
+			case "app.bsky.embed.video#view" -> List.of(new MediaSummary("video", blankToNull(Json.text(media, "playlist")),
+					blankToNull(Json.text(media, "thumbnail")), blankToNull(Json.text(media, "alt"))));
+			default -> List.of();
+		};
+	}
+
+	private static @Nullable String blankToNull(String value) {
+		return value.isBlank() ? null : value;
+	}
+
+	/**
+	 * {@code maxBytes} for images: the configured limit (the lexicon's 2 MB by default), lowered to the PDS's
+	 * {@code blobUploadLimit} when that is smaller. Cached; after a failure, retried at most once per 10 minutes.
+	 */
+	private synchronized ServerLimits serverLimits() {
+		Instant now = clock.instant();
+		ServerLimits limits = serverLimits;
+		if (limits == null || (!limits.ok()
+				&& Duration.between(limits.attemptedAt(), now).compareTo(SERVER_RETRY_BACKOFF) >= 0)) {
+			limits = fetchServerLimits(now);
+			serverLimits = limits;
+		}
+		return limits;
+	}
+
+	private ServerLimits fetchServerLimits(Instant now) {
+		try {
+			JsonNode body = Json.required(http.get().uri("/com.atproto.server.describeServer").retrieve().body(JsonNode.class),
+					PLATFORM);
+			JsonNode limit = body.get("blobUploadLimit");
+			return new ServerLimits(limit != null && limit.isNumber() ? limit.asLong() : null, true, now);
+		}
+		catch (RestClientException ex) {
+			log.warn("Could not read the Bluesky PDS upload limit, using social.bluesky.max-image-bytes: {}",
+					ex.getMessage());
+			return new ServerLimits(null, false, now);
+		}
+	}
+
+	private ImageRules imageRules() {
+		ServerLimits limits = serverLimits();
+		long configured = properties.bluesky().maxImageBytes();
+		Long blobLimit = limits.blobUploadLimit();
+		long maxBytes = blobLimit == null ? configured : Math.min(configured, blobLimit);
+		return new ImageRules(MAX_IMAGES, maxBytes, null, MAX_ALT_TEXT, ImageFormats.SNIFFABLE, true, false,
+				RECOMMENDED_MAX_DIMENSION, blobLimit == null ? "lexicon" : "lexicon+server");
 	}
 
 	private Map<String, Object> postRecord(String text) {
@@ -533,8 +698,12 @@ public class BlueskyService implements SocialPlatformService {
 	}
 
 	@Override
-	public PublishedPost reply(ReplyTarget target, String text) {
-		return createPost(text, target.root(), target.parent());
+	public PublishedPost reply(ReplyTarget target, String text, List<PreparedImage> images) {
+		Map<String, Object> record = replyRecord(text, target.root(), target.parent());
+		if (!images.isEmpty()) {
+			record.put("embed", uploadImages(images));
+		}
+		return publishPost(record, images);
 	}
 
 	// --- Quotes, polls and votes (SPEC §5, Quote; polls unsupported) ---
@@ -551,16 +720,26 @@ public class BlueskyService implements SocialPlatformService {
 	}
 
 	@Override
-	public NewPost createTopLevelPost(String content, @Nullable QuoteTarget quote, @Nullable PollInput poll) {
+	public NewPost createTopLevelPost(String content, @Nullable QuoteTarget quote, @Nullable PollInput poll,
+			List<PreparedImage> images) {
 		if (poll != null) {
 			throw new IllegalArgumentException(NO_POLLS);
 		}
 		Map<String, Object> record = postRecord(content);
-		if (quote != null) {
-			record.put("embed", Map.of("$type", "app.bsky.embed.record", "record",
-					Map.of("uri", quote.quoted().id(), "cid", String.valueOf(quote.quoted().cid()))));
+		@Nullable Map<String, Object> quoteEmbed = quote == null ? null : Map.of("$type", "app.bsky.embed.record", "record",
+				Map.of("uri", quote.quoted().id(), "cid", String.valueOf(quote.quoted().cid())));
+		@Nullable Map<String, Object> imagesEmbed = images.isEmpty() ? null : uploadImages(images);
+		if (quoteEmbed != null && imagesEmbed != null) {
+			record.put("embed", Map.of("$type", "app.bsky.embed.recordWithMedia", "record", quoteEmbed, "media",
+					imagesEmbed));
 		}
-		return new NewPost(publishPost(record), null);
+		else if (quoteEmbed != null) {
+			record.put("embed", quoteEmbed);
+		}
+		else if (imagesEmbed != null) {
+			record.put("embed", imagesEmbed);
+		}
+		return new NewPost(publishPost(record, images), null);
 	}
 
 	@Override
@@ -617,7 +796,7 @@ public class BlueskyService implements SocialPlatformService {
 		return new PostingRules(PLATFORM, MAX_GRAPHEMES, "graphemes", null, MAX_BYTES, maxParts, " (n/N)",
 				(" (" + maxParts + "/" + maxParts + ")").length(), null,
 				"Counts user-perceived characters (an emoji counts as 1). URLs count at their full length.", "fixed", true,
-				null);
+				null, imageRules());
 	}
 
 	@Override
@@ -764,7 +943,8 @@ public class BlueskyService implements SocialPlatformService {
 		JsonNode record = post.get("record");
 		return new PostResult(PLATFORM, uri, "@" + authorHandle, Json.text(record, "text"),
 				Json.isoUtc(Json.text(record, "createdAt")), postUrl(authorHandle, uri), Json.number(post, "replyCount"),
-				Json.number(post, "repostCount"), Json.number(post, "likeCount"), toQuote(post.get("embed")), null);
+				Json.number(post, "repostCount"), Json.number(post, "likeCount"), toQuote(post.get("embed")), null,
+				toMedia(post.get("embed")));
 	}
 
 	private static String postUrl(String authorHandle, String uri) {
