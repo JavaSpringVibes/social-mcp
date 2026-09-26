@@ -90,6 +90,22 @@ This command runs the tests and produces `target/social-mcp-server-0.0.1-SNAPSHO
 [Error Prone](https://errorprone.info) and [NullAway](https://github.com/uber/NullAway), so it fails on null-safety
 violations. The javac flags they need are already in `.mvn/jvm.config`.
 
+### CI and releases
+
+GitHub Actions builds and tests every push to `main` and every pull request, on Linux and Windows
+(`.github/workflows/ci.yml`). The jar from the Linux build is attached to the workflow run.
+
+To publish a release, push a version tag:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+`.github/workflows/release.yml` then sets the project version from the tag, builds and tests, and creates a GitHub
+release with `social-mcp-server-0.1.0.jar` attached. A tag with a suffix, such as `v0.2.0-rc1`, is published as a
+pre-release.
+
 ## Getting credentials
 
 You only need credentials for the platforms you want to use. Missing credentials never stop the server from starting,
