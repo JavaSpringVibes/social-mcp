@@ -38,7 +38,7 @@ jobs:
 
       - name: Upload test reports
         if: failure()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: test-reports-${{ matrix.os }}
           path: target/surefire-reports/
@@ -46,7 +46,7 @@ jobs:
 
       - name: Upload jar
         if: matrix.os == 'ubuntu-latest'
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: social-mcp-server
           path: target/social-mcp-server-*.jar
