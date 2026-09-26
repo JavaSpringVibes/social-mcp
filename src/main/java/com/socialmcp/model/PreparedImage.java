@@ -6,15 +6,17 @@ package com.socialmcp.model;
  */
 public record PreparedImage(int index, byte[] bytes, String mimeType, int width, int height, String altText) {
 
-	/** The file extension for the MIME type, e.g. {@code jpg}. */
-	public String extension() {
-		return switch (mimeType) {
-			case "image/jpeg" -> "jpg";
-			case "image/png" -> "png";
-			case "image/gif" -> "gif";
-			case "image/webp" -> "webp";
-			default -> "bin";
-		};
-	}
+    /**
+     * The file extension for the MIME type, e.g. {@code jpg}.
+     */
+    public String extension() {
+        return switch (mimeType) {
+            case "image/jpeg" -> "jpg";
+            case "image/png" -> "png";
+            case "image/gif" -> "gif";
+            case "image/webp" -> "webp";
+            default -> "bin";
+        };
+    }
 
 }

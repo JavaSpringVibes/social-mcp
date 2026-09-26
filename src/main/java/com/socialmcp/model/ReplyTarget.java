@@ -7,9 +7,9 @@ import org.jspecify.annotations.Nullable;
  * {@code mention} is the author acct to mention, or null when no mention is needed.
  */
 public record ReplyTarget(
-		PostResult inReplyTo,
-		PublishedPost parent,
-		PublishedPost root,
-		@Nullable String visibility,
-		@Nullable String mention) {
+        PostResult inReplyTo,
+        PublishedPost parent,
+        PublishedPost root,
+        @Nullable String visibility,
+        @Nullable String mention) {
 }

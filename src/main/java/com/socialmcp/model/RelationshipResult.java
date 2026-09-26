@@ -7,9 +7,9 @@ import org.jspecify.annotations.Nullable;
  * user when the status alone could mislead, otherwise null.
  */
 public record RelationshipResult(
-		String platform,
-		String action,
-		String status,
-		AccountSummary account,
-		@Nullable String note) {
+        String platform,
+        String action,
+        String status,
+        AccountSummary account,
+        @Nullable String note) {
 }

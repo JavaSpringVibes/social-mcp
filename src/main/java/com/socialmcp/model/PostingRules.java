@@ -7,18 +7,18 @@ import org.jspecify.annotations.Nullable;
  * {@code polls} is null where the platform has no polls; {@code images} holds the image limits.
  */
 public record PostingRules(
-		String platform,
-		int maxLength,
-		String unit,
-		@Nullable Integer urlLength,
-		@Nullable Integer maxBytes,
-		int maxThreadParts,
-		String numberingFormat,
-		int numberingReserve,
-		@Nullable String followUpVisibility,
-		String countingNotes,
-		String source,
-		boolean quotes,
-		@Nullable PollRules polls,
-		ImageRules images) {
+        String platform,
+        int maxLength,
+        String unit,
+        @Nullable Integer urlLength,
+        @Nullable Integer maxBytes,
+        int maxThreadParts,
+        String numberingFormat,
+        int numberingReserve,
+        @Nullable String followUpVisibility,
+        String countingNotes,
+        String source,
+        boolean quotes,
+        @Nullable PollRules polls,
+        ImageRules images) {
 }

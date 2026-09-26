@@ -7,9 +7,9 @@ import org.jspecify.annotations.Nullable;
  * otherwise the other fields may be null. The quoted post's own quote and poll are never included.
  */
 public record QuoteSummary(
-		String state,
-		@Nullable String id,
-		@Nullable String author,
-		@Nullable String text,
-		@Nullable String url) {
+        String state,
+        @Nullable String id,
+        @Nullable String author,
+        @Nullable String text,
+        @Nullable String url) {
 }
