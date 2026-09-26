@@ -397,7 +397,7 @@ class MastodonActionsTest {
 		ReplyTarget target = service.replyTarget("7");
 		assertThat(target.mention()).isEqualTo(BOB);
 		assertThat(target.visibility()).isEqualTo("unlisted");
-		assertThat(service.reply(target, "@" + BOB + " thanks").url()).isEqualTo("https://mastodon.test/@me/200");
+		assertThat(service.reply(target, "@" + BOB + " thanks", List.of()).url()).isEqualTo("https://mastodon.test/@me/200");
 		assertThat(reply.requests.get(0).body().toString())
 			.isEqualTo("{\"status\":\"@" + BOB + " thanks\",\"in_reply_to_id\":\"7\",\"visibility\":\"unlisted\"}");
 		assertThat(reply.requests.get(0).headers().getFirst("Idempotency-Key")).isNotBlank();
@@ -421,7 +421,7 @@ class MastodonActionsTest {
 		QuoteTarget target = service.quoteTarget("7");
 		assertThat(target.caveat()).isNull();
 		assertThat(target.visibility()).isEqualTo("public");
-		NewPost created = service.createTopLevelPost("my take", target, null);
+		NewPost created = service.createTopLevelPost("my take", target, null, List.of());
 		assertThat(created.caveat()).isNull();
 		assertThat(post.requests.get(0).body().toString())
 			.isEqualTo("{\"status\":\"my take\",\"visibility\":\"public\",\"quoted_status_id\":\"7\"}");
@@ -440,7 +440,7 @@ class MastodonActionsTest {
 		expectGet("/api/v1/statuses/7", status("7", "42", ",\"quote_approval\":{\"current_user\":\"automatic\"}"));
 		expectPost("/api/v1/statuses", "{\"id\":\"300\",\"url\":\"u\",\"quote\":{\"state\":\"pending\"}}");
 		QuoteTarget target = service.quoteTarget("7");
-		assertThat(service.createTopLevelPost("x", target, null).caveat())
+		assertThat(service.createTopLevelPost("x", target, null, List.of()).caveat())
 			.isEqualTo("the quote is waiting for @" + BOB + " to approve it");
 	}
 
@@ -507,7 +507,7 @@ class MastodonActionsTest {
 	@Test
 	void pollIsPostedWithSecondsAndDefaults() {
 		Capture post = expectPost("/api/v1/statuses", "{\"id\":\"400\",\"url\":\"u\"}");
-		service.createTopLevelPost("Java or Kotlin?", null, new PollInput(List.of(" Java ", "Kotlin"), null, null, null));
+		service.createTopLevelPost("Java or Kotlin?", null, new PollInput(List.of(" Java ", "Kotlin"), null, null, null), List.of());
 		assertThat(post.requests.get(0).body().toString()).isEqualTo("""
 				{"status":"Java or Kotlin?","visibility":"public","poll":{"options":["Java","Kotlin"],\
 				"expires_in":86400,"multiple":false,"hide_totals":false}}""");

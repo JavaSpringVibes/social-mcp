@@ -1,6 +1,7 @@
 package com.socialmcp.platform.mastodon;
 
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -25,7 +26,11 @@ import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.core.io.ByteArrayResource;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.http.client.MultipartBodyBuilder;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.HttpClientErrorException;
 import org.springframework.web.client.HttpServerErrorException;
@@ -35,8 +40,11 @@ import org.springframework.web.client.RestClientException;
 import org.springframework.web.client.RestClientResponseException;
 
 import com.socialmcp.config.SocialProperties;
+import com.socialmcp.media.ImageFormats;
 import com.socialmcp.model.AccountAction;
 import com.socialmcp.model.AccountSummary;
+import com.socialmcp.model.ImageRules;
+import com.socialmcp.model.MediaSummary;
 import com.socialmcp.model.NewPost;
 import com.socialmcp.model.PartCheck;
 import com.socialmcp.model.PollInput;
@@ -48,6 +56,7 @@ import com.socialmcp.model.PostActionResult;
 import com.socialmcp.model.PostInteractions;
 import com.socialmcp.model.PostResult;
 import com.socialmcp.model.PostingRules;
+import com.socialmcp.model.PreparedImage;
 import com.socialmcp.model.ProfileResult;
 import com.socialmcp.model.PublishedPost;
 import com.socialmcp.model.QuoteSummary;
@@ -97,6 +106,19 @@ public class MastodonService implements SocialPlatformService {
 
 	private static final int DEFAULT_POLL_MAX_EXPIRATION = 2_629_746;
 
+	// Mastodon's own media defaults (SPEC §5, posting rules).
+	private static final int DEFAULT_MAX_MEDIA = 4;
+
+	private static final long DEFAULT_IMAGE_SIZE_LIMIT = 16_777_216;
+
+	private static final long DEFAULT_IMAGE_MATRIX_LIMIT = 33_177_600;
+
+	private static final int DEFAULT_DESCRIPTION_LIMIT = 1500;
+
+	private static final Duration MEDIA_POLL_INTERVAL = Duration.ofSeconds(1);
+
+	private static final String MEDIA_SCOPE_TOOL = "createSocialPost / replyToSocialPost (images)";
+
 	private static final Pattern HASHTAG_QUERY = Pattern.compile("^#\\w+$", Pattern.UNICODE_CHARACTER_CLASS);
 
 	private static final Pattern HANDLE = Pattern.compile("^[A-Za-z0-9_]+(@[A-Za-z0-9.-]+\\.[A-Za-z]{2,})?$");
@@ -109,7 +131,17 @@ public class MastodonService implements SocialPlatformService {
 
 	private final Clock clock;
 
+	private final Sleeper sleeper;
+
 	private final AtomicReference<@Nullable String> ownAccountId = new AtomicReference<>();
+
+	/** Waits between media-processing polls; injectable so tests don't sleep. */
+	@FunctionalInterface
+	interface Sleeper {
+
+		void sleep(Duration duration) throws InterruptedException;
+
+	}
 
 	/** The cached instance limits and when they were fetched; null until first use. */
 	private @Nullable InstanceState instanceState;
@@ -120,8 +152,13 @@ public class MastodonService implements SocialPlatformService {
 	}
 
 	MastodonService(SocialProperties properties, RestClient.Builder builder, Clock clock) {
+		this(properties, builder, clock, d -> Thread.sleep(d));
+	}
+
+	MastodonService(SocialProperties properties, RestClient.Builder builder, Clock clock, Sleeper sleeper) {
 		this.properties = properties;
 		this.clock = clock;
+		this.sleeper = sleeper;
 		this.http = builder.baseUrl(properties.mastodon().instanceUrl())
 			.defaultHeader(HttpHeaders.AUTHORIZATION, "Bearer " + properties.mastodon().accessToken())
 			.build();
@@ -145,6 +182,12 @@ public class MastodonService implements SocialPlatformService {
 	@Override
 	public boolean supportsPolls() {
 		return true;
+	}
+
+	/** Mastodon strips metadata itself when it processes an upload (SPEC §5, Images). */
+	@Override
+	public boolean stripsImageMetadata() {
+		return false;
 	}
 
 	// --- Search, timelines, user posts ---
@@ -398,8 +441,16 @@ public class MastodonService implements SocialPlatformService {
 		return new PublishedPost(Json.text(created, "id"), null, Json.text(created, "url"));
 	}
 
-	/** Posts a status, retrying once with the same Idempotency-Key on a network error or 5xx (SPEC §5, Post). */
 	private JsonNode publish(Map<String, Object> body) {
+		return publish(body, List.of());
+	}
+
+	/**
+	 * Posts a status, retrying once with the same Idempotency-Key on a network error or 5xx (SPEC §5, Post). With
+	 * media, a 422 saying the media aren't processed yet waits for them and retries once with the same key (SPEC §5,
+	 * Images).
+	 */
+	private JsonNode publish(Map<String, Object> body, List<String> mediaIds) {
 		String idempotencyKey = UUID.randomUUID().toString();
 		try {
 			return postStatus(body, idempotencyKey);
@@ -408,6 +459,112 @@ public class MastodonService implements SocialPlatformService {
 			// Safe to retry: Mastodon returns the already-created status for a repeated Idempotency-Key.
 			return postStatus(body, idempotencyKey);
 		}
+		catch (HttpClientErrorException ex) {
+			if (mediaIds.isEmpty() || !isUnprocessable(ex)
+					|| !serverMessage(ex).toLowerCase(Locale.ROOT).contains("processing")) {
+				throw ex;
+			}
+			for (int i = 0; i < mediaIds.size(); i++) {
+				awaitProcessed(mediaIds.get(i), i + 1, mediaIds.size());
+			}
+			return postStatus(body, idempotencyKey);
+		}
+	}
+
+	// --- Images (SPEC §5, Images) ---
+
+	/** Uploads each image in order and returns the media ids, waiting for any still being processed. */
+	private List<String> uploadImages(List<PreparedImage> images) {
+		return withScopes("write:media", MEDIA_SCOPE_TOOL, () -> {
+			List<String> ids = new ArrayList<>();
+			for (PreparedImage image : images) {
+				ids.add(uploadImage(image, images.size()));
+			}
+			return ids;
+		});
+	}
+
+	private String uploadImage(PreparedImage image, int total) {
+		MultipartBodyBuilder parts = new MultipartBodyBuilder();
+		String filename = "image-" + image.index() + "." + image.extension();
+		parts.part("file", new ByteArrayResource(image.bytes()) {
+			@Override
+			public String getFilename() {
+				return filename;
+			}
+		}).contentType(MediaType.parseMediaType(image.mimeType()));
+		parts.part("description", image.altText(), new MediaType("text", "plain", StandardCharsets.UTF_8));
+		ResponseEntity<JsonNode> response;
+		try {
+			response = http.post()
+				.uri("/api/v2/media")
+				.contentType(MediaType.MULTIPART_FORM_DATA)
+				.body(parts.build())
+				.retrieve()
+				.toEntity(JsonNode.class);
+		}
+		catch (HttpClientErrorException.Forbidden ex) {
+			if (isScopeError(ex)) {
+				throw ex;
+			}
+			throw uploadFailure(image.index(), total, serverMessage(ex));
+		}
+		catch (RestClientResponseException ex) {
+			throw uploadFailure(image.index(), total, serverMessage(ex));
+		}
+		catch (ResourceAccessException ex) {
+			throw uploadFailure(image.index(), total, "mastodon is unreachable: " + ex.getMostSpecificCause().getMessage());
+		}
+		JsonNode media = Json.required(response.getBody(), PLATFORM);
+		String id = Json.text(media, "id");
+		if (response.getStatusCode().value() == 202 || Json.text(media, "url").isEmpty()) {
+			awaitProcessed(id, image.index(), total);
+		}
+		return id;
+	}
+
+	/** Polls {@code GET /api/v1/media/{id}} once a second until it is processed (200) or the timeout passes. */
+	private void awaitProcessed(String mediaId, int index, int total) {
+		Instant deadline = clock.instant().plus(properties.media().processingTimeout());
+		while (true) {
+			ResponseEntity<JsonNode> response = http.get().uri("/api/v1/media/{id}", mediaId).retrieve().toEntity(JsonNode.class);
+			if (response.getStatusCode().value() == 200 && !Json.text(response.getBody(), "url").isEmpty()) {
+				return;
+			}
+			if (!clock.instant().isBefore(deadline)) {
+				throw uploadFailure(index, total, "Mastodon is still processing it");
+			}
+			try {
+				sleeper.sleep(MEDIA_POLL_INTERVAL);
+			}
+			catch (InterruptedException ex) {
+				Thread.currentThread().interrupt();
+				throw uploadFailure(index, total, "interrupted while Mastodon was processing it");
+			}
+		}
+	}
+
+	private static IllegalStateException uploadFailure(int index, int total, String reason) {
+		String trimmed = reason.endsWith(".") ? reason.substring(0, reason.length() - 1) : reason;
+		return new IllegalStateException("Image " + index + " of " + total + " could not be uploaded to " + PLATFORM + ": "
+				+ trimmed + ". Nothing was posted.");
+	}
+
+	private static List<MediaSummary> toMedia(JsonNode status) {
+		return Json.array(status, "media_attachments").stream().map(m -> {
+			String type = switch (Json.text(m, "type")) {
+				case "image", "gifv", "video", "audio" -> Json.text(m, "type");
+				default -> "unknown";
+			};
+			String url = Json.text(m, "url");
+			if (url.isEmpty()) {
+				url = Json.text(m, "remote_url");
+			}
+			String preview = Json.text(m, "preview_url");
+			String description = Json.text(m, "description");
+			return new MediaSummary(type, url.isEmpty() ? null : url, preview.isEmpty() ? null : preview,
+					description.isBlank() ? null : description);
+		}).toList();
 	}
 
 	private JsonNode postStatus(Map<String, Object> body, String idempotencyKey) {
@@ -428,7 +585,7 @@ public class MastodonService implements SocialPlatformService {
 				(" (" + maxParts + "/" + maxParts + ")").length(), properties.mastodon().threadVisibility(),
 				"Counts user-perceived characters (an emoji counts as 1). Every http(s) URL counts as "
 						+ info.urlLength() + ". A mention @user@domain counts only as @user.",
-				info.source(), info.quotes(), info.polls());
+				info.source(), info.quotes(), info.polls(), info.images());
 	}
 
 	@Override
@@ -670,12 +827,16 @@ public class MastodonService implements SocialPlatformService {
 	}
 
 	@Override
-	public PublishedPost reply(ReplyTarget target, String text) {
+	public PublishedPost reply(ReplyTarget target, String text, List<PreparedImage> images) {
+		List<String> mediaIds = images.isEmpty() ? List.of() : uploadImages(images);
 		Map<String, Object> body = new LinkedHashMap<>();
 		body.put("status", text);
 		body.put("in_reply_to_id", target.parent().id());
 		body.put("visibility", target.visibility() == null ? "public" : target.visibility());
-		JsonNode created = publish(body);
+		if (!mediaIds.isEmpty()) {
+			body.put("media_ids", mediaIds);
+		}
+		JsonNode created = publish(body, mediaIds);
 		return new PublishedPost(Json.text(created, "id"), null, Json.text(created, "url"));
 	}
 
@@ -710,7 +871,9 @@ public class MastodonService implements SocialPlatformService {
 	}
 
 	@Override
-	public NewPost createTopLevelPost(String content, @Nullable QuoteTarget quote, @Nullable PollInput poll) {
+	public NewPost createTopLevelPost(String content, @Nullable QuoteTarget quote, @Nullable PollInput poll,
+			List<PreparedImage> images) {
+		List<String> mediaIds = images.isEmpty() ? List.of() : uploadImages(images);
 		Map<String, Object> body = new LinkedHashMap<>();
 		body.put("status", content);
 		body.put("visibility", quote != null && quote.visibility() != null ? quote.visibility() : "public");
@@ -725,9 +888,12 @@ public class MastodonService implements SocialPlatformService {
 			pollBody.put("hide_totals", poll.hideTotalsOrDefault());
 			body.put("poll", pollBody);
 		}
+		if (!mediaIds.isEmpty()) {
+			body.put("media_ids", mediaIds);
+		}
 		JsonNode created;
 		try {
-			created = publish(body);
+			created = publish(body, mediaIds);
 		}
 		catch (HttpClientErrorException ex) {
 			if (quote == null || !isUnprocessable(ex)) {
@@ -848,7 +1014,8 @@ public class MastodonService implements SocialPlatformService {
 
 	// --- Instance limits and domain ---
 
-	record InstanceInfo(int maxLength, int urlLength, String domain, String source, boolean quotes, PollRules polls) {
+	record InstanceInfo(int maxLength, int urlLength, String domain, String source, boolean quotes, PollRules polls,
+			ImageRules images) {
 	}
 
 	private record InstanceState(InstanceInfo info, Instant attemptedAt) {
@@ -877,13 +1044,36 @@ public class MastodonService implements SocialPlatformService {
 			boolean quotes = body.path("api_versions").path("mastodon").asInt(0) >= QUOTES_API_VERSION;
 			return new InstanceInfo(statuses.get("max_characters").asInt(), statuses.get("characters_reserved_per_url").asInt(),
 					domain.isEmpty() ? configuredHost() : domain, "instance", quotes,
-					pollRules(body.path("configuration").path("polls")));
+					pollRules(body.path("configuration").path("polls")),
+					imageRules(statuses, body.path("configuration").path("media_attachments"), "instance"));
 		}
 		catch (RestClientException | IllegalStateException ex) {
 			log.warn("Could not read Mastodon instance limits, using configured fallback: {}", ex.getMessage());
 			return new InstanceInfo(properties.mastodon().maxLength(), DEFAULT_URL_LENGTH, configuredHost(), "fallback",
-					false, pollRules(null));
+					false, pollRules(null), imageRules(null, null, "fallback"));
 		}
+	}
+
+	/**
+	 * Image limits from {@code configuration.statuses} and {@code configuration.media_attachments}, each missing value
+	 * falling back to Mastodon's own default. Quotes and polls can't carry media on Mastodon.
+	 */
+	static ImageRules imageRules(@Nullable JsonNode statuses, @Nullable JsonNode media, String source) {
+		JsonNode types = media == null ? null : media.get("supported_mime_types");
+		List<String> mimeTypes = types != null && types.isArray()
+				? ImageFormats.SNIFFABLE.stream()
+					.filter(t -> Json.elements(types).stream().anyMatch(v -> t.equals(v.asString(""))))
+					.toList()
+				: ImageFormats.SNIFFABLE;
+		return new ImageRules(intOr(statuses, "max_media_attachments", DEFAULT_MAX_MEDIA),
+				longOr(media, "image_size_limit", DEFAULT_IMAGE_SIZE_LIMIT),
+				longOr(media, "image_matrix_limit", DEFAULT_IMAGE_MATRIX_LIMIT),
+				intOr(media, "description_limit", DEFAULT_DESCRIPTION_LIMIT), mimeTypes, false, false, null, source);
+	}
+
+	private static long longOr(@Nullable JsonNode node, String field, long fallback) {
+		JsonNode value = node == null ? null : node.get(field);
+		return value != null && value.isNumber() ? value.asLong() : fallback;
 	}
 
 	/** Poll limits from {@code configuration.polls}, each missing value falling back to Mastodon's own default. */
@@ -961,7 +1151,8 @@ public class MastodonService implements SocialPlatformService {
 		return new PostResult(PLATFORM, Json.text(s, "id"), handleOf(s.get("account")),
 				HtmlText.toPlainText(Json.text(s, "content"), hasQuote), Json.isoUtc(Json.text(s, "created_at")),
 				Json.text(s, "url"), Json.number(s, "replies_count"), Json.number(s, "reblogs_count"),
-				Json.number(s, "favourites_count"), hasQuote ? toQuote(s.get("quote")) : null, toPoll(s.get("poll")));
+				Json.number(s, "favourites_count"), hasQuote ? toQuote(s.get("quote")) : null, toPoll(s.get("poll")),
+				toMedia(s));
 	}
 
 	/** A boost is represented by the boosted status (SPEC §5, post mapping). */

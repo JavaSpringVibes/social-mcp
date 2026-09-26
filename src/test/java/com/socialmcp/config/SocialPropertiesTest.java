@@ -85,6 +85,24 @@ class SocialPropertiesTest {
 	}
 
 	@Test
+	void imageSettingsHaveDefaultsAndLimits() {
+		runner.run(context -> {
+			SocialProperties p = context.getBean(SocialProperties.class);
+			assertThat(p.media().allowedDirs()).isEmpty();
+			assertThat(p.media().allowUrls()).isTrue();
+			assertThat(p.media().maxReadBytes()).isEqualTo(20_971_520);
+			assertThat(p.media().downloadTimeout()).hasSeconds(30);
+			assertThat(p.bluesky().maxImageBytes()).isEqualTo(2_000_000);
+		});
+		assertStartupFails("social.bluesky.max-image-bytes=2000001", "bluesky.maxImageBytes",
+				"must be between 1 and 2000000");
+		assertStartupFails("social.media.max-read-bytes=0", "media.maxReadBytes", "must be between 1 and 104857600");
+		runner.withPropertyValues("social.media.allowed-dirs=relative/dir")
+			.run(context -> assertThat(context).hasFailed());
+		runner.withPropertyValues("social.media.processing-timeout=10m").run(context -> assertThat(context).hasFailed());
+	}
+
+	@Test
 	void invalidMastodonMaxLengthFailsStartup() {
 		assertStartupFails("social.mastodon.max-length=0", "mastodon.maxLength", "must be positive");
 	}

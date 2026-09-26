@@ -6,8 +6,10 @@ import java.util.function.IntPredicate;
 
 import org.jspecify.annotations.Nullable;
 
+import com.socialmcp.media.ImageFormats;
 import com.socialmcp.model.AccountAction;
 import com.socialmcp.model.AccountSummary;
+import com.socialmcp.model.ImageRules;
 import com.socialmcp.model.NewPost;
 import com.socialmcp.model.PartCheck;
 import com.socialmcp.model.PollInput;
@@ -17,6 +19,7 @@ import com.socialmcp.model.PostActionResult;
 import com.socialmcp.model.PostInteractions;
 import com.socialmcp.model.PostResult;
 import com.socialmcp.model.PostingRules;
+import com.socialmcp.model.PreparedImage;
 import com.socialmcp.model.ProfileResult;
 import com.socialmcp.model.PublishedPost;
 import com.socialmcp.model.QuoteTarget;
@@ -45,6 +48,15 @@ class FakePlatform implements SocialPlatformService {
 	IntPredicate failPostNumber = n -> false;
 
 	boolean polls = true;
+
+	/** Image limits reported by {@link #postingRules}; tests may replace them. */
+	ImageRules imageRules = new ImageRules(4, 1000, 10_000L, 50, ImageFormats.SNIFFABLE, true, false, null, "fixed");
+
+	/** Whether images get metadata stripped (like Bluesky). */
+	boolean stripImages;
+
+	/** The images passed to the last post or reply. */
+	List<PreparedImage> attached = List.of();
 
 	/** What {@link #replyTarget} reports as the author to mention; null means no mention is needed. */
 	@Nullable String replyMention = "alice@example.social";
@@ -125,12 +137,17 @@ class FakePlatform implements SocialPlatformService {
 	@Override
 	public PostingRules postingRules() {
 		return new PostingRules(id, 20, "graphemes", null, null, 10, " (n/N)", 8, null, "", "fixed", true,
-				polls ? new PollRules(4, 50, 5, 43829) : null);
+				polls ? new PollRules(4, 50, 5, 43829) : null, imageRules);
 	}
 
 	@Override
 	public boolean supportsPolls() {
 		return polls;
+	}
+
+	@Override
+	public boolean stripsImageMetadata() {
+		return stripImages;
 	}
 
 	@Override
@@ -160,8 +177,9 @@ class FakePlatform implements SocialPlatformService {
 	}
 
 	@Override
-	public PublishedPost reply(ReplyTarget target, String text) {
+	public PublishedPost reply(ReplyTarget target, String text, List<PreparedImage> images) {
 		calls.add("reply:" + target.parent().id() + ":" + text);
+		attached = images;
 		return new PublishedPost("r1", null, "https://example/r1");
 	}
 
@@ -172,7 +190,9 @@ class FakePlatform implements SocialPlatformService {
 	}
 
 	@Override
-	public NewPost createTopLevelPost(String content, @Nullable QuoteTarget quote, @Nullable PollInput poll) {
+	public NewPost createTopLevelPost(String content, @Nullable QuoteTarget quote, @Nullable PollInput poll,
+			List<PreparedImage> images) {
+		attached = images;
 		calls.add("topLevel:" + content + ":" + (quote == null ? null : quote.quoted().id()) + ":"
 				+ (poll == null ? null : poll.options()));
 		PublishedPost published = createPost(content, null, null);
@@ -186,7 +206,7 @@ class FakePlatform implements SocialPlatformService {
 	}
 
 	private PostResult post(String postRef) {
-		return new PostResult(id, postRef, "@alice@example.social", "text", null, "u", 0, 0, 0, null, null);
+		return new PostResult(id, postRef, "@alice@example.social", "text", null, "u", 0, 0, 0, null, null, List.of());
 	}
 
 	@Override

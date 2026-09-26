@@ -340,7 +340,7 @@ class BlueskyActionsTest {
 		Capture create = expectCreate();
 		ReplyTarget target = service.replyTarget(POST_URI);
 		assertThat(target.mention()).isNull();
-		service.reply(target, "thanks");
+		service.reply(target, "thanks", List.of());
 		assertThat(create.requests.get(0).body().path("record").path("reply")).isEqualTo(json("""
 				{"root":{"uri":"at://did:plc:r/app.bsky.feed.post/root","cid":"croot"},"parent":{"uri":"%s","cid":"cp"}}"""
 			.formatted(POST_URI)));
@@ -366,7 +366,7 @@ class BlueskyActionsTest {
 		Capture create = expectPost("/com.atproto.repo.createRecord",
 				"{\"uri\":\"at://" + ME + "/app.bsky.feed.post/3q\",\"cid\":\"cq\"}");
 		QuoteTarget target = service.quoteTarget(POST_URI);
-		assertThat(service.createTopLevelPost("my take", target, null).caveat()).isNull();
+		assertThat(service.createTopLevelPost("my take", target, null, List.of()).caveat()).isNull();
 		assertThat(create.requests.get(0).body().path("record").path("embed")).isEqualTo(json("""
 				{"$type":"app.bsky.embed.record","record":{"uri":"%s","cid":"cp"}}""".formatted(POST_URI)));
 	}
@@ -381,7 +381,7 @@ class BlueskyActionsTest {
 	@Test
 	void pollsAreNotSupported() {
 		server.reset();
-		assertThatThrownBy(() -> service.createTopLevelPost("q", null, new PollInput(List.of("a", "b"), null, null, null)))
+		assertThatThrownBy(() -> service.createTopLevelPost("q", null, new PollInput(List.of("a", "b"), null, null, null), List.of()))
 			.hasMessage("Bluesky doesn't support polls");
 		assertThatThrownBy(() -> service.vote(POST_URI, List.of(1))).hasMessage("Bluesky doesn't support polls");
 		assertThat(service.supportsPolls()).isFalse();

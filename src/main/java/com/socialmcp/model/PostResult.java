@@ -1,8 +1,13 @@
 package com.socialmcp.model;
 
+import java.util.List;
+
 import org.jspecify.annotations.Nullable;
 
-/** A normalized post (SPEC §4, Tool 1). {@code quote} and {@code poll} are null when the post has none. */
+/**
+ * A normalized post (SPEC §4, Tool 1). {@code quote} and {@code poll} are null when the post has none; {@code media} is
+ * empty when nothing is attached.
+ */
 public record PostResult(
 		String platform,
 		String id,
@@ -14,19 +19,22 @@ public record PostResult(
 		long repostCount,
 		long likeCount,
 		@Nullable QuoteSummary quote,
-		@Nullable PollSummary poll) {
+		@Nullable PollSummary poll,
+		List<MediaSummary> media) {
 
 	public PostResult withLikeCount(long count) {
-		return new PostResult(platform, id, author, text, createdAt, url, replyCount, repostCount, count, quote, poll);
+		return new PostResult(platform, id, author, text, createdAt, url, replyCount, repostCount, count, quote, poll,
+				media);
 	}
 
 	public PostResult withRepostCount(long count) {
-		return new PostResult(platform, id, author, text, createdAt, url, replyCount, count, likeCount, quote, poll);
+		return new PostResult(platform, id, author, text, createdAt, url, replyCount, count, likeCount, quote, poll,
+				media);
 	}
 
 	public PostResult withPoll(@Nullable PollSummary newPoll) {
 		return new PostResult(platform, id, author, text, createdAt, url, replyCount, repostCount, likeCount, quote,
-				newPoll);
+				newPoll, media);
 	}
 
 }

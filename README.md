@@ -31,11 +31,11 @@ Built with Java 25, Spring Boot 4.1 and Spring AI 2.0. It runs over the STDIO tr
 | `getSocialTrends` | Trending tags and posts (Mastodon) or trending topics (Bluesky) |
 | `findSimilarAccounts` | Accounts that post content similar to a given user |
 | `getSocialBookmarks` | Your bookmarked posts, most recently bookmarked first |
-| `getSocialPostingRules` | The platform's length limits, how it counts characters, and its quote and poll support |
-| `checkSocialPost` | Measure draft posts against the limits without posting |
-| `createSocialPost` | Publish a single post, optionally quoting another post or (Mastodon) with a poll |
+| `getSocialPostingRules` | The platform's length limits, how it counts characters, its quote and poll support, and its image limits |
+| `checkSocialPost` | Measure draft posts, and check image files, against the limits without posting |
+| `createSocialPost` | Publish a single post, optionally quoting another post, with up to 4 images, or (Mastodon) with a poll |
 | `createSocialThread` | Publish a numbered self-thread, checking every part before anything is posted |
-| `replyToSocialPost` | Reply to any post; on Mastodon the author is @mentioned so they're notified |
+| `replyToSocialPost` | Reply to any post, optionally with images; on Mastodon the author is @mentioned so they're notified |
 | `setAccountRelationship` | `follow`, `unfollow`, `block`, `unblock`, `mute` or `unmute` an account |
 | `setPostAction` | `like`, `unlike`, `repost`, `unrepost`, `bookmark` or `unbookmark` a post |
 | `voteInSocialPoll` | Vote in a Mastodon poll |
@@ -43,8 +43,28 @@ Built with Java 25, Spring Boot 4.1 and Spring AI 2.0. It runs over the STDIO tr
 Every tool takes a `platform` argument (`mastodon` or `bluesky`). Tool definitions only list the platforms you have
 configured credentials for, so if you configure only one platform, the agent never sees the other.
 
-Every post returned by a tool includes its `quote` (the post it quotes, if any) and `poll` (numbered options, counts,
-and your own vote), so the agent can read and act on them.
+Every post returned by a tool includes its `quote` (the post it quotes, if any), `poll` (numbered options, counts,
+and your own vote) and `media` (attached images and videos with their alt text), so the agent can read and act on
+them.
+
+### Images
+
+`createSocialPost` and `replyToSocialPost` take up to 4 images, each with alt text. An image is an absolute file path
+on your computer or an `https://` URL; the server reads or downloads it itself. JPEG, PNG, GIF and WebP are supported.
+
+The server checks every image before uploading anything, and never resizes one. Limits differ: Mastodon reports its
+own (usually 16 MB and 33 megapixels), and Bluesky allows 2 MB per image. `checkSocialPost` checks image files without
+posting and, for any that are too large, gives the size to resize to (`fitWithin`). On Bluesky the server removes EXIF
+and other metadata, such as GPS location, before upload; Mastodon does this itself.
+
+| Client | Images |
+|---|---|
+| **Claude Code** | Fully supported, and recommended: it works with your files directly and can resize or convert images (for example iPhone HEIC photos) before posting |
+| **Claude Desktop** | Works when you give a file path and the image already fits the limits. Photos attached to the chat can't be posted, because the server can't see them |
+| **Cowork** | Not supported for images, because its files live in a sandbox the server can't read. Text tools work |
+
+When an image can't be posted, the error says why and what to do, for example to give a path on your computer or to
+resize the image to a given size.
 
 **Safe to retry:** each write action first checks the current state and does nothing if it's already as asked. For
 example, following someone you already follow reports `already-following`, and it doesn't reset your notification
@@ -93,6 +113,7 @@ and that platform is simply left out of the tools.
    | `write:favourites` | Like and unlike |
    | `write:bookmarks` | Bookmark and unbookmark |
    | `read:bookmarks` | `getSocialBookmarks` |
+   | `write:media` | Posts and replies with images |
 
 5. Click **Submit**, open the application, and copy **Your access token**.
 
@@ -173,6 +194,12 @@ All settings are environment variables. Only the credentials are needed, and eve
 | `BLUESKY_HANDLE` | *(empty)* | Your Bluesky handle, without `@` |
 | `BLUESKY_APP_PASSWORD` | *(empty)* | Bluesky app password. When it's empty, Bluesky is disabled |
 | `BLUESKY_PDS_URL` | `https://bsky.social` | Your PDS, if self-hosted |
+| `BLUESKY_MAX_IMAGE_BYTES` | `2000000` | Largest Bluesky image. Set `1000000` if your self-hosted PDS still enforces the old 1 MB limit |
+| `SOCIAL_MEDIA_ALLOWED_DIRS` | *(empty)* | Comma-separated directories images may be read from. Empty means any file the server can read |
+| `SOCIAL_MEDIA_ALLOW_URLS` | `true` | Set to `false` to accept only local image files |
+| `SOCIAL_MEDIA_MAX_READ_BYTES` | `20971520` | Largest image file read or downloaded (20 MiB) |
+| `SOCIAL_MEDIA_DOWNLOAD_TIMEOUT` | `30s` | Time limit for downloading an image URL |
+| `SOCIAL_MEDIA_PROCESSING_TIMEOUT` | `30s` | How long to wait for Mastodon to process an upload |
 | `SOCIAL_POSTING_ENABLED` | `true` | Set to `false` to run read-only: every tool that changes something (posts, replies, follows, blocks, mutes, likes, reposts, bookmarks, votes) refuses, while reading keeps working |
 | `SOCIAL_READ_DEFAULT_LIMIT` | `10` | Items returned when the agent gives no `limit` |
 | `SOCIAL_READ_MAX_LIMIT` | `40` | Upper bound for `limit` (1–100) |
@@ -184,8 +211,9 @@ startup with a message there that names the problem.
 
 ## Limitations
 
-- Only text posts are supported, with no images or video. On Bluesky, links and mentions are posted as plain text
-  and aren't clickable.
+- Posts can carry images, but not video. Images can't be combined with a poll, or with a quote on Mastodon, and
+  threads don't take images (post the first part with `createSocialPost`, then reply). On Bluesky, links and
+  mentions are posted as plain text and aren't clickable.
 - Deleting or editing posts, direct messages, and approving follow requests aren't supported. Neither are blocking
   or muting a whole server, or managing Bluesky moderation lists.
 - Bluesky has no polls, so polls and voting are Mastodon-only. Neither platform has a "dislike": `unlike` removes
@@ -202,6 +230,7 @@ src/main/java/com/socialmcp/
 ├── tools/      MCP tool definitions and argument validation
 ├── platform/   SocialPlatformService, plus one implementation per platform (mastodon/, bluesky/)
 ├── model/      Records returned by the tools
+├── media/      Reading, checking and stripping metadata from images
 ├── text/       Post length counting and HTML-to-text conversion
 └── config/     Typed, validated configuration
 ```
